@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            name="fanctl-${VERSION}-linux-${arch}"
+            mkdir -p "build/${name}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "build/${name}/fanctl" .
+            cp README.md fanctl.example.json fanctl.service "build/${name}/"
+            tar -C build -czf "dist/${name}.tar.gz" "${name}"
+          done
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

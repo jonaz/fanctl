@@ -96,6 +96,15 @@ Tune the disk curve with your temperature graph: if the hottest disk sits above
 
 Do not run it at the same time as smfc or other tools that set fan duties.
 
+## Releases
+
+Push a version tag to build static linux/amd64 and linux/arm64 binaries and
+publish a GitHub release with tarballs and `SHA256SUMS`:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 ## Build
 
 ```bash
