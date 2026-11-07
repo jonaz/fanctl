@@ -13,32 +13,36 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - run: go vet ./...
-      - run: go test -count=1 ./...
+      - name: Test
+        run: go test ./...
 
       - name: Build
         env:
-          VERSION: ${{ github.ref_name }}
+          CGO_ENABLED: "0"
         run: |
-          mkdir -p dist
           for arch in amd64 arm64; do
-            name="fanctl-${VERSION}-linux-${arch}"
-            mkdir -p "build/${name}"
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath \
-              -ldflags "-s -w -X main.version=${VERSION}" \
-              -o "build/${name}/fanctl" .
-            cp README.md fanctl.example.json fanctl.service "build/${name}/"
-            tar -C build -czf "dist/${name}.tar.gz" "${name}"
+            bin="fanctl-linux-${arch}"
+            GOOS=linux GOARCH="${arch}" go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "${bin}" .
+            sha256sum "${bin}" > "${bin}.sha256"
+            cat "${bin}.sha256"
           done
-          cd dist && sha256sum *.tar.gz > SHA256SUMS
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/SHA256SUMS
-          generate_release_notes: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            fanctl-linux-amd64 fanctl-linux-amd64.sha256 \
+            fanctl-linux-arm64 fanctl-linux-arm64.sha256 \
+            fanctl.example.json fanctl.service \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "fanctl built from ${GITHUB_SHA}.
+          sha256 linux-amd64: $(cut -d' ' -f1 fanctl-linux-amd64.sha256)
+          sha256 linux-arm64: $(cut -d' ' -f1 fanctl-linux-arm64.sha256)"
