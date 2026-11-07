@@ -1,0 +1,271 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fakeRunner returns canned output per command line and records calls.
+type fakeRunner struct {
+	out   map[string]string
+	err   map[string]error
+	calls []string
+}
+
+func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	key := strings.TrimSpace(name + " " + strings.Join(args, " "))
+	f.calls = append(f.calls, key)
+	return []byte(f.out[key]), f.err[key]
+}
+
+func TestInterpolate(t *testing.T) {
+	c := [][2]float64{{30, 20}, {40, 60}, {50, 100}}
+	cases := map[float64]float64{10: 20, 30: 20, 35: 40, 40: 60, 45: 80, 50: 100, 90: 100}
+	for in, want := range cases {
+		if got := Interpolate(c, in); got != want {
+			t.Errorf("Interpolate(%v) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestExampleConfigLoads(t *testing.T) {
+	c, err := LoadConfig("fanctl.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Zones) != 2 || c.Zones[1].Interval.Duration != 30*time.Second {
+		t.Fatalf("unexpected config: %+v", c.Zones)
+	}
+}
+
+func TestValidateRejects(t *testing.T) {
+	bad := []Config{
+		{Zones: nil},
+		{Zones: []Zone{{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{40, 20}}}}}}},
+		{Zones: []Zone{{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{40, 20}, {30, 50}}}}}}},
+		{Zones: []Zone{{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "fan", Curve: [][2]float64{{1, 1}, {2, 2}}}}}}},
+		{Zones: []Zone{
+			{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{1, 1}, {2, 2}}}}},
+			{Name: "b", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{1, 1}, {2, 2}}}}},
+		}},
+	}
+	for i, c := range bad {
+		if err := c.Validate(); err == nil {
+			t.Errorf("config %d: expected validation error", i)
+		}
+	}
+}
+
+func TestCPUSensor(t *testing.T) {
+	root := t.TempDir()
+	sysRoot = root
+	defer func() { sysRoot = "/" }()
+	write := func(p, s string) {
+		full := filepath.Join(root, p)
+		os.MkdirAll(filepath.Dir(full), 0o755)
+		os.WriteFile(full, []byte(s), 0o644)
+	}
+	write("sys/class/hwmon/hwmon0/name", "acpitz\n")
+	write("sys/class/hwmon/hwmon0/temp1_input", "90000\n") // not the CPU, ignored
+	write("sys/class/hwmon/hwmon1/name", "coretemp\n")
+	write("sys/class/hwmon/hwmon1/temp1_input", "52000\n")
+	write("sys/class/hwmon/hwmon1/temp2_input", "48000\n")
+
+	r, err := (&cpuSensor{drivers: []string{"coretemp"}}).Read(context.Background())
+	if err != nil || r.Temp != 52 {
+		t.Fatalf("got %+v, %v; want 52", r, err)
+	}
+	if _, err := (&cpuSensor{drivers: []string{"k10temp"}}).Read(context.Background()); err == nil {
+		t.Fatal("expected error when driver missing")
+	}
+}
+
+const smartOK = `{"smartctl":{"exit_status":0},"temperature":{"current":%d}}`
+const smartSleep = `{"smartctl":{"exit_status":2,"messages":[{"string":"Device is in STANDBY mode, exit(2)","severity":"information"}]}}`
+
+func smartKey(dev string) string { return "smartctl -n standby -A -j " + dev }
+
+func TestDiskSensor(t *testing.T) {
+	f := &fakeRunner{out: map[string]string{
+		smartKey("/dev/sda"): fmt.Sprintf(smartOK, 38),
+		smartKey("/dev/sdb"): fmt.Sprintf(smartOK, 44),
+		smartKey("/dev/sdc"): smartSleep,
+	}, err: map[string]error{
+		// smartctl's exit bitmask is often non-zero with valid data
+		smartKey("/dev/sdb"): errors.New("exit status 64"),
+		smartKey("/dev/sdc"): errors.New("exit status 2"),
+	}}
+	s := &diskSensor{run: f, bin: "smartctl", devices: []string{"/dev/sda", "/dev/sdb", "/dev/sdc"}}
+	r, err := s.Read(context.Background())
+	if err != nil || r.Temp != 44 || !strings.Contains(r.Detail, "/dev/sdb") || !strings.Contains(r.Detail, "1 asleep") {
+		t.Fatalf("got %+v, %v", r, err)
+	}
+
+	// All asleep: idle, no error, nothing woken.
+	s.devices = []string{"/dev/sdc"}
+	r, err = s.Read(context.Background())
+	if err != nil || !r.Idle {
+		t.Fatalf("all asleep: got %+v, %v", r, err)
+	}
+
+	// One disk unreadable: keep the others' max, but report the error.
+	f.out[smartKey("/dev/sdx")] = ""
+	f.err[smartKey("/dev/sdx")] = errors.New("exit status 2")
+	s.devices = []string{"/dev/sda", "/dev/sdx"}
+	r, err = s.Read(context.Background())
+	if err == nil || r.Temp != 38 {
+		t.Fatalf("partial failure: got %+v, %v", r, err)
+	}
+}
+
+func TestGPUSensor(t *testing.T) {
+	f := &fakeRunner{out: map[string]string{
+		"nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits": "61\n",
+	}}
+	r, err := (&gpuSensor{run: f, bin: "nvidia-smi"}).Read(context.Background())
+	if err != nil || r.Temp != 61 {
+		t.Fatalf("got %+v, %v", r, err)
+	}
+}
+
+// stubSensor returns a scripted sequence of readings.
+type stubSensor struct {
+	name string
+	seq  []Reading
+	errs []error
+	i    int
+}
+
+func (s *stubSensor) Name() string { return s.name }
+func (s *stubSensor) Read(context.Context) (Reading, error) {
+	i := s.i
+	if i >= len(s.seq) {
+		i = len(s.seq) - 1
+	}
+	s.i++
+	var err error
+	if i < len(s.errs) {
+		err = s.errs[i]
+	}
+	return s.seq[i], err
+}
+
+func newZone(f *fakeRunner, srcs ...*source) *zoneCtl {
+	return &zoneCtl{
+		cfg:     Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2},
+		sources: srcs,
+		ipmi:    &IPMI{run: f, bin: "ipmitool"},
+		reapply: 5 * time.Minute,
+		duty:    -1,
+	}
+}
+
+func lastDuty(f *fakeRunner) string {
+	if len(f.calls) == 0 {
+		return ""
+	}
+	p := strings.Fields(f.calls[len(f.calls)-1])
+	return p[len(p)-1]
+}
+
+func TestZoneTakesHighestDemand(t *testing.T) {
+	f := &fakeRunner{}
+	curve := [][2]float64{{30, 30}, {50, 100}}
+	disks := &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: &stubSensor{name: "disks", seq: []Reading{{Temp: 35}}}, avg: window{size: 1}}
+	gpu := &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: &stubSensor{name: "gpu", seq: []Reading{{Temp: 45}}}, avg: window{size: 1}}
+	z := newZone(f, disks, gpu)
+	z.step(context.Background(), time.Now())
+	// gpu 45 °C → 30 + 15/20*70 = 82.5 → 83 % (0x53)
+	if got := lastDuty(f); got != "0x53" {
+		t.Fatalf("duty = %s, want 0x53; calls %v", got, f.calls)
+	}
+	if f.calls[0] != "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53" {
+		t.Fatalf("raw command = %q", f.calls[0])
+	}
+}
+
+func TestZoneMinChangeAndReapply(t *testing.T) {
+	f := &fakeRunner{}
+	curve := [][2]float64{{30, 30}, {50, 100}}
+	st := &stubSensor{name: "disks", seq: []Reading{{Temp: 40}, {Temp: 40.2}, {Temp: 42}}}
+	z := newZone(f, &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: st, avg: window{size: 1}})
+	t0 := time.Now()
+	z.step(context.Background(), t0) // 65 %
+	z.step(context.Background(), t0.Add(time.Second))
+	if len(f.calls) != 1 {
+		t.Fatalf("tiny change should not be sent: %v", f.calls)
+	}
+	z.step(context.Background(), t0.Add(6*time.Minute)) // 72 %, and reapply due anyway
+	if len(f.calls) != 2 || lastDuty(f) != "0x48" {
+		t.Fatalf("calls %v", f.calls)
+	}
+}
+
+func TestZoneFailsafeAndIdle(t *testing.T) {
+	f := &fakeRunner{}
+	curve := [][2]float64{{30, 30}, {50, 100}}
+	boom := errors.New("boom")
+	st := &stubSensor{name: "gpu",
+		seq:  []Reading{{}, {}, {}, {Temp: 30}},
+		errs: []error{boom, boom, boom, nil}}
+	z := newZone(f, &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: st, avg: window{size: 1}})
+	ctx := context.Background()
+	t0 := time.Now()
+	z.step(ctx, t0)
+	z.step(ctx, t0.Add(time.Second))
+	if lastDuty(f) != "0x1e" { // min duty while below fail threshold
+		t.Fatalf("before failsafe: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(2*time.Second))
+	if lastDuty(f) != "0x64" {
+		t.Fatalf("failsafe should go to 100%%: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(3*time.Second)) // recovered
+	if lastDuty(f) != "0x1e" {
+		t.Fatalf("after recovery: %v", f.calls)
+	}
+
+	idle := &stubSensor{name: "disks", seq: []Reading{{Idle: true}}}
+	z2 := newZone(f, &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: idle, avg: window{size: 1}})
+	z2.step(ctx, t0)
+	if lastDuty(f) != "0x1e" {
+		t.Fatalf("idle disks should leave min duty: %v", f.calls)
+	}
+}
+
+func TestSetModeCommand(t *testing.T) {
+	f := &fakeRunner{}
+	if err := (&IPMI{run: f, bin: "ipmitool"}).SetMode(context.Background(), fanModes["full"]); err != nil {
+		t.Fatal(err)
+	}
+	if f.calls[0] != "ipmitool raw 0x30 0x45 0x01 0x01" {
+		t.Fatalf("got %q", f.calls[0])
+	}
+}
+
+func TestBuildZonesOptionalGPU(t *testing.T) {
+	c, err := LoadConfig("fanctl.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Zones[1].Sources[0].Devices = []string{"/dev/sda"}
+	look := func(bin string) (string, error) {
+		if bin == "nvidia-smi" {
+			return "", errors.New("not found")
+		}
+		return "/usr/bin/" + bin, nil
+	}
+	zones, err := buildZones(c, &fakeRunner{}, &IPMI{}, look)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(zones[1].sources); n != 1 {
+		t.Fatalf("optional gpu should be skipped, got %d sources", n)
+	}
+}

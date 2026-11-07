@@ -1,0 +1,174 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+)
+
+// Duration lets durations be written as "3s" or "1m" in JSON.
+type Duration struct{ time.Duration }
+
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("duration must be a string like \"30s\": %w", err)
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	d.Duration = v
+	return nil
+}
+
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
+
+type Config struct {
+	Ipmitool  string `json:"ipmitool"`   // path to ipmitool
+	Smartctl  string `json:"smartctl"`   // path to smartctl
+	NvidiaSmi string `json:"nvidia_smi"` // path to nvidia-smi
+	// Fan mode to restore on exit so the BMC takes over again:
+	// "standard", "full", "optimal", "heavyio" or "" to leave as is.
+	ExitMode string `json:"exit_mode"`
+	// Re-send the current duty at least this often, in case the BMC resets it.
+	Reapply Duration `json:"reapply"`
+	Zones   []Zone   `json:"zones"`
+}
+
+type Zone struct {
+	Name     string   `json:"name"`
+	IpmiZone int      `json:"ipmi_zone"` // 0 = CPU/system (FAN1-4), 1 = peripheral (FANA)
+	Interval Duration `json:"interval"`
+	MinDuty  int      `json:"min_duty"`
+	MaxDuty  int      `json:"max_duty"`
+	// Smallest duty change worth sending; avoids constant small adjustments.
+	MinChange int `json:"min_change"`
+	// Readings averaged per source (moving average) before applying the curve.
+	Smoothing int      `json:"smoothing"`
+	Sources   []Source `json:"sources"`
+}
+
+type Source struct {
+	Type string `json:"type"` // "cpu", "disks" or "gpu"
+	// Curve points as [temp °C, duty %], sorted by temperature.
+	Curve [][2]float64 `json:"curve"`
+	// cpu: hwmon driver names to read, default ["coretemp", "k10temp"].
+	Hwmon []string `json:"hwmon,omitempty"`
+	// disks: device paths; empty = autodetect /dev/sd* and /dev/nvme*n1.
+	Devices []string `json:"devices,omitempty"`
+	// After this many failed reads in a row the source demands max duty.
+	FailAfter int `json:"fail_after,omitempty"`
+	// Optional: skip this source if its tool or hardware is missing,
+	// instead of failing safe to max duty.
+	Optional bool `json:"optional,omitempty"`
+}
+
+var fanModes = map[string]int{"standard": 0, "full": 1, "optimal": 2, "heavyio": 4}
+
+func LoadConfig(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	c.applyDefaults()
+	return &c, c.Validate()
+}
+
+func (c *Config) applyDefaults() {
+	if c.Ipmitool == "" {
+		c.Ipmitool = "ipmitool"
+	}
+	if c.Smartctl == "" {
+		c.Smartctl = "smartctl"
+	}
+	if c.NvidiaSmi == "" {
+		c.NvidiaSmi = "nvidia-smi"
+	}
+	if c.Reapply.Duration == 0 {
+		c.Reapply.Duration = 5 * time.Minute
+	}
+	for i := range c.Zones {
+		z := &c.Zones[i]
+		if z.Interval.Duration == 0 {
+			z.Interval.Duration = 5 * time.Second
+		}
+		if z.MaxDuty == 0 {
+			z.MaxDuty = 100
+		}
+		if z.MinChange == 0 {
+			z.MinChange = 2
+		}
+		if z.Smoothing == 0 {
+			z.Smoothing = 3
+		}
+		for j := range z.Sources {
+			s := &z.Sources[j]
+			if s.FailAfter == 0 {
+				s.FailAfter = 3
+			}
+			if s.Type == "cpu" && len(s.Hwmon) == 0 {
+				s.Hwmon = []string{"coretemp", "k10temp"}
+			}
+		}
+	}
+}
+
+func (c *Config) Validate() error {
+	if c.ExitMode != "" {
+		if _, ok := fanModes[c.ExitMode]; !ok {
+			return fmt.Errorf("exit_mode %q: want standard, full, optimal, heavyio or empty", c.ExitMode)
+		}
+	}
+	if len(c.Zones) == 0 {
+		return errors.New("no zones configured")
+	}
+	seen := map[int]string{}
+	for _, z := range c.Zones {
+		if prev, ok := seen[z.IpmiZone]; ok {
+			return fmt.Errorf("zones %q and %q both use ipmi_zone %d", prev, z.Name, z.IpmiZone)
+		}
+		seen[z.IpmiZone] = z.Name
+		if z.IpmiZone < 0 || z.IpmiZone > 255 {
+			return fmt.Errorf("zone %q: ipmi_zone out of range", z.Name)
+		}
+		if z.MinDuty < 0 || z.MaxDuty > 100 || z.MinDuty > z.MaxDuty {
+			return fmt.Errorf("zone %q: need 0 <= min_duty <= max_duty <= 100", z.Name)
+		}
+		if len(z.Sources) == 0 {
+			return fmt.Errorf("zone %q: no sources", z.Name)
+		}
+		for _, s := range z.Sources {
+			switch s.Type {
+			case "cpu", "disks", "gpu":
+			default:
+				return fmt.Errorf("zone %q: unknown source type %q", z.Name, s.Type)
+			}
+			if err := validateCurve(s.Curve); err != nil {
+				return fmt.Errorf("zone %q source %s: %w", z.Name, s.Type, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateCurve(c [][2]float64) error {
+	if len(c) < 2 {
+		return errors.New("curve needs at least 2 points")
+	}
+	for i, p := range c {
+		if p[1] < 0 || p[1] > 100 {
+			return fmt.Errorf("curve point %d: duty %.0f outside 0-100", i, p[1])
+		}
+		if i > 0 && p[0] <= c[i-1][0] {
+			return fmt.Errorf("curve temperatures must increase (point %d)", i)
+		}
+	}
+	return nil
+}

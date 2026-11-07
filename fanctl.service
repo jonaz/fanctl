@@ -1,0 +1,16 @@
+[Unit]
+Description=fanctl - Supermicro fan zones from CPU, disk and GPU temperature
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fanctl -config /etc/fanctl.json
+Restart=always
+RestartSec=5
+# On stop, fanctl hands control back to the BMC (exit_mode in the config).
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
