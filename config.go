@@ -124,7 +124,7 @@ func (c *Config) applyDefaults() {
 			z.Smoothing = 1
 		}
 		if z.StartupDuty == nil {
-			v := max(70, z.MinDuty)
+			v := min(max(70, z.MinDuty), z.MaxDuty)
 			z.StartupDuty = &v
 		}
 		if z.RampDownDelay == nil {
@@ -173,8 +173,8 @@ func (c *Config) Validate() error {
 		if z.Interval.Duration < 0 || z.Smoothing < 1 || z.MinChange < 1 {
 			return fmt.Errorf("zone %q: interval must be positive, smoothing and min_change at least 1", z.Name)
 		}
-		if z.StartupDuty != nil && (*z.StartupDuty < z.MinDuty || *z.StartupDuty > 100) {
-			return fmt.Errorf("zone %q: startup_duty must be between min_duty and 100", z.Name)
+		if z.StartupDuty != nil && (*z.StartupDuty < z.MinDuty || *z.StartupDuty > z.MaxDuty) {
+			return fmt.Errorf("zone %q: startup_duty must be between min_duty and max_duty", z.Name)
 		}
 		if z.RampDownDelay != nil && z.RampDownDelay.Duration < 0 {
 			return fmt.Errorf("zone %q: ramp_down_delay must not be negative", z.Name)

@@ -78,9 +78,6 @@ func main() {
 	}
 }
 
-// readTimeout bounds each external command (smartctl, nvidia-smi, ipmitool).
-const readTimeout = 20 * time.Second
-
 type lookPathFunc func(string) (string, error)
 
 func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*zoneCtl, error) {
@@ -122,7 +119,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 				}
 				sen = &gpuSensor{run: run, bin: cfg.NvidiaSmi}
 			}
-			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}, stuckMin: readTimeout + 5*time.Second})
+			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}})
 			if z.tick == 0 || sc.Interval.Duration < z.tick {
 				z.tick = sc.Interval.Duration
 			}

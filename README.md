@@ -29,9 +29,11 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   when the drop is first seen), then lowered
   by at most `ramp_down_rate` % per minute (default 10) until it reaches the
   target. Fans react to heat immediately but don't hunt up and down.
-  `startup_duty` and failsafe act as a floor on top of this: they can only
-  raise the fans, and when they end the duty continues from wherever the
-  real readings' hold and ramp have got to.
+  `startup_duty` is a floor on top of this: it can only raise the fans, and
+  once every source has reported the duty goes straight to what the
+  readings call for. Failsafe instead counts as a real `max_duty` demand, so
+  after a sensor recovers the fans hold and ramp down from 100% and a flaky
+  sensor can't make them hunt.
 - `hysteresis` (°C, per source) ignores small temperature drops, so a disk
   flickering between 40 and 41 °C doesn't move the fans. `smoothing` (moving
   average, default 1 = off) helps with spiky sensors such as the CPU.
@@ -46,20 +48,18 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 ### Failsafes
 
 - Until every source has given a good reading, the zone runs at
-  `startup_duty` (default 70%, or `min_duty` if higher; it may not be set
-  below `min_duty`).
+  `startup_duty` (default 70%, kept within `min_duty`…`max_duty`; setting it
+  outside that range is an error).
 - A single failed read keeps the source's last demand. If the disks were all
   asleep and a read then fails, the zone goes back to `startup_duty`.
 - A partial reading (some disks unreadable) can only raise demand, never
   lower it or release `startup_duty`: the missing disk may be the hot one.
 - A source that fails to read `fail_after` times in a row (default 3), or
-  whose read hangs for `fail_after` × `interval` (at least as long as one read
-  can legitimately take: 25 s, or 20 s per batch of 8 disks plus 5 s, so one
-  slow command just counts as one error), demands `max_duty` until it
+  whose read runs longer than it legitimately can (25 s, or 20 s per batch of
+  8 disks plus 5 s, whatever the poll interval), demands `max_duty` until it
   recovers. This includes a single disk that stops answering: the fan wall
-  goes to 100% and the log says which disk. Its last real demand is kept
-  meanwhile, so recovering cool starts the normal hold and ramp from there,
-  and the first reading after recovery isn't averaged with old ones.
+  goes to 100% and the log says which disk. The first reading after
+  recovery isn't averaged with readings from before the failure.
 - A failed fan write is retried at most every half tick, so a hung BMC
   doesn't block the zone on every reading.
 - `optional: true` on a source skips it at startup if its tool is missing

@@ -85,8 +85,16 @@ type diskSensor struct {
 // Based on the latest detection, so disks that appear later count.
 func (s *diskSensor) maxReadTime() time.Duration {
 	n := max(int64(len(s.devices)), s.count.Load())
-	batches := max(1, (n+maxParallelSmartctl-1)/maxParallelSmartctl)
-	return time.Duration(batches)*readTimeout + 5*time.Second
+	return readBudget(max(1, (n+maxParallelSmartctl-1)/maxParallelSmartctl))
+}
+
+// readTimeout bounds each external command (smartctl, nvidia-smi, ipmitool).
+const readTimeout = 20 * time.Second
+
+// readBudget is how long a read made of n rounds of commands may take:
+// one readTimeout each, plus a margin.
+func readBudget(n int64) time.Duration {
+	return time.Duration(n)*readTimeout + 5*time.Second
 }
 
 func (s *diskSensor) Name() string { return "disks" }

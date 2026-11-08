@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,7 @@ func TestValidateRejects(t *testing.T) {
 		{"both use ipmi_zone", []Zone{zone("a", 0, "cpu", ok), zone("b", 0, "cpu", ok)}},
 		{"fail_after", []Zone{{Name: "a", Sources: []Source{{Type: "cpu", Curve: ok, FailAfter: -1}}}}},
 		{"startup_duty must be between min_duty", []Zone{{Name: "a", MinDuty: 30, StartupDuty: ptr(20), Sources: []Source{{Type: "cpu", Curve: ok}}}}},
+		{"startup_duty must be between min_duty", []Zone{{Name: "a", MaxDuty: 60, StartupDuty: ptr(80), Sources: []Source{{Type: "cpu", Curve: ok}}}}},
 	}
 	for i, b := range bad {
 		// Defaults first, as LoadConfig does, so each case reaches its check.
@@ -83,6 +85,12 @@ func TestValidateRejects(t *testing.T) {
 	}
 	if got := *good.Zones[1].StartupDuty; got != 80 {
 		t.Errorf("default startup_duty with min_duty 80 = %d, want 80", got)
+	}
+	capped := Config{Zones: []Zone{zone("a", 0, "cpu", ok)}}
+	capped.Zones[0].MaxDuty = 60 // default startup_duty (70) is capped
+	capped.applyDefaults()
+	if err := capped.Validate(); err != nil || *capped.Zones[0].StartupDuty != 60 {
+		t.Errorf("max_duty 60: startup_duty %d, err %v; want 60, nil", *capped.Zones[0].StartupDuty, err)
 	}
 }
 
@@ -340,7 +348,10 @@ func TestStartupAndFailsafe(t *testing.T) {
 	if lastDuty(f) != duty(100) {
 		t.Fatalf("failsafe should go to 100%%: %v", f.calls)
 	}
+	// Recovery is a drop from real 100 %: no delay here, so the (huge)
+	// ramp takes effect on the tick after the drop is first seen.
 	z.step(ctx, t0.Add(3*time.Second))
+	z.step(ctx, t0.Add(4*time.Second))
 	if lastDuty(f) != duty(30) {
 		t.Fatalf("after recovery: %v", f.calls)
 	}
@@ -404,9 +415,16 @@ type blockingSensor struct {
 	started chan struct{}
 	release chan struct{}
 	reads   atomic.Int32
+	budget  time.Duration // max read time; 0 = the default
 }
 
 func (b *blockingSensor) Name() string { return "disks" }
+func (b *blockingSensor) maxReadTime() time.Duration {
+	if b.budget == 0 {
+		return readBudget(1)
+	}
+	return b.budget
+}
 func (b *blockingSensor) Read(ctx context.Context) (Reading, error) {
 	if b.reads.Add(1) == 1 {
 		close(b.started)
@@ -599,42 +617,6 @@ func TestDiskSensorReadsInParallel(t *testing.T) {
 	}
 }
 
-func TestLeavingStartupOrFailsafeSkipsRamp(t *testing.T) {
-	boom := errors.New("boom")
-	f := &fakeRunner{}
-	// default hold (2 m) and rate (10 %/min) from newZone
-	st := &stubSensor{name: "disks",
-		seq:  []Reading{{}, {Temp: 30}, {}, {}, {}, {Temp: 32}},
-		errs: []error{boom, nil, boom, boom, boom, nil}}
-	z := newZone(f, newSource(st, time.Second, 0))
-	ctx, t0 := context.Background(), time.Now()
-	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
-	z.step(ctx, at(0))
-	if lastDuty(f) != duty(70) {
-		t.Fatalf("startup: %v", f.calls)
-	}
-	z.step(ctx, at(1)) // first good reading: straight to 30 %, no hold
-	if lastDuty(f) != duty(30) {
-		t.Fatalf("leaving startup should skip the ramp: %v", f.calls)
-	}
-	for i := 2; i <= 4; i++ {
-		z.step(ctx, at(i))
-	}
-	if lastDuty(f) != duty(100) {
-		t.Fatalf("failsafe: %v", f.calls)
-	}
-	z.step(ctx, at(5)) // recovered at 32 °C → 37 %
-	if lastDuty(f) != duty(37) {
-		t.Fatalf("recovering from failsafe should skip the ramp: %v", f.calls)
-	}
-	// A real drop after that still holds.
-	z.sources[0].sensor = &stubSensor{name: "disks", seq: temps(30)}
-	z.step(ctx, at(6))
-	if lastDuty(f) != duty(37) {
-		t.Fatalf("real drop should hold: %v", f.calls)
-	}
-}
-
 func TestHotReadingNotLostToQuickRepoll(t *testing.T) {
 	f := &fakeRunner{}
 	st := &stubSensor{name: "cpu", seq: temps(30, 50, 30)}
@@ -671,7 +653,7 @@ func TestLoopAppliesPollAsSoonAsItFinishes(t *testing.T) {
 
 func TestStuckPollFailsSafe(t *testing.T) {
 	f := &fakeRunner{}
-	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{}), budget: 3 * time.Second}
 	z := newZone(f, newSource(&stubSensor{}, time.Second, 0))
 	z.sources[0].sensor = disk
 	z.async = true
@@ -683,7 +665,7 @@ func TestStuckPollFailsSafe(t *testing.T) {
 	if lastDuty(f) != duty(70) {
 		t.Fatalf("before fail_after × interval: %v", f.calls)
 	}
-	z.step(ctx, t0.Add(3*time.Second)) // fail_after 3 × 1 s
+	z.step(ctx, t0.Add(3*time.Second)) // the read budget
 	if lastDuty(f) != duty(100) {
 		t.Fatalf("hung poll should fail safe: %v", f.calls)
 	}
@@ -738,7 +720,7 @@ func TestStuckLimitAtLeastCommandTimeout(t *testing.T) {
 	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
 	z := newZone(f, newSource(&stubSensor{}, time.Second, 0))
 	z.sources[0].sensor = disk
-	z.async, z.sources[0].stuckMin = true, 25*time.Second
+	z.async, disk.budget = true, 25*time.Second
 	ctx, t0 := context.Background(), time.Now()
 	z.clock = func() time.Time { return t0 }
 	z.step(ctx, t0)
@@ -805,31 +787,6 @@ func TestUnseenFailsafeIsNotTreatedAsReading(t *testing.T) {
 	z.evaluate(ctx, time.Now())
 	if lastDuty(f) != duty(37) {
 		t.Fatalf("unseen failsafe latched as a real 100%% demand: %v", f.calls)
-	}
-}
-
-func TestLeavingFailsafeKeepsRealDemandHold(t *testing.T) {
-	f := &fakeRunner{}
-	boom := errors.New("boom")
-	cpu := newSource(&stubSensor{name: "cpu", seq: temps(48, 48, 48, 48, 30)}, time.Second, 0) // 93 %
-	disks := newSource(&stubSensor{name: "disks", seq: []Reading{{Temp: 30}, {}, {}, {}, {Temp: 30}},
-		errs: []error{nil, boom, boom, boom, nil}}, time.Second, 0)
-	z := newZone(f, cpu, disks)
-	ctx, t0 := context.Background(), time.Now()
-	for i := 0; i <= 3; i++ {
-		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
-	}
-	if lastDuty(f) != duty(100) {
-		t.Fatalf("disk failsafe: %v", f.calls)
-	}
-	// Both recover cool: the cpu was really at 93 %, so hold there.
-	z.step(ctx, t0.Add(4*time.Second))
-	if lastDuty(f) != duty(93) {
-		t.Fatalf("leaving failsafe should resume the real 93%% and hold: %v", f.calls)
-	}
-	z.step(ctx, t0.Add(4*time.Second+time.Minute))
-	if lastDuty(f) != duty(93) {
-		t.Fatalf("should still hold: %v", f.calls)
 	}
 }
 
@@ -951,45 +908,6 @@ func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
 	}
 }
 
-func TestFailsafeKeepsRealDemand(t *testing.T) {
-	f := &fakeRunner{}
-	boom := errors.New("boom")
-	st := &stubSensor{name: "gpu", seq: []Reading{{Temp: 45}, {}, {}, {}, {Temp: 30}},
-		errs: []error{nil, boom, boom, boom, nil}}
-	z := newZone(f, newSource(st, time.Second, 0))
-	ctx, t0 := context.Background(), time.Now()
-	for i := 0; i <= 3; i++ {
-		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
-	}
-	if lastDuty(f) != duty(100) {
-		t.Fatalf("failsafe: %v", f.calls)
-	}
-	// Ten minutes later the sensor recovers cool. The real demand was 83 %
-	// all along, so the drop starts now: hold at 83, not straight to 30.
-	z.step(ctx, t0.Add(10*time.Minute))
-	if lastDuty(f) != duty(83) {
-		t.Fatalf("failsafe advanced the ramp-down: %v", f.calls)
-	}
-}
-
-func TestRecoveryReadingNotAveragedWithOldOnes(t *testing.T) {
-	f := &fakeRunner{}
-	boom := errors.New("boom")
-	st := &stubSensor{name: "disks", seq: []Reading{{Temp: 38}, {Temp: 38}, {}, {}, {}, {Temp: 44}},
-		errs: []error{nil, nil, boom, boom, boom, nil}}
-	s := newSource(st, time.Second, 0)
-	s.avg = window{size: 3}
-	z := newZone(f, s)
-	ctx, t0 := context.Background(), time.Now()
-	for i := 0; i <= 5; i++ {
-		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
-	}
-	// 44 °C alone → 79 %; averaged with the old 38s it would be 40 °C → 65 %.
-	if lastDuty(f) != duty(79) {
-		t.Fatalf("recovery reading mixed with pre-failure average: %v", f.calls)
-	}
-}
-
 func TestFailedWriteRetriedAtMostEveryHalfTick(t *testing.T) {
 	f := &fakeRunner{err: map[string]error{}}
 	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0))
@@ -1011,4 +929,74 @@ func TestFailedWriteRetriedAtMostEveryHalfTick(t *testing.T) {
 	if len(f.calls) != 2 || z.duty != 83 {
 		t.Fatalf("write not retried after half a tick: duty %d, %v", z.duty, f.calls)
 	}
+}
+
+func TestStartupSnapsFailsafeRamps(t *testing.T) {
+	boom := errors.New("boom")
+	f := &fakeRunner{}
+	// default hold (2 m) and rate (10 %/min) from newZone
+	st := &stubSensor{name: "gpu",
+		seq:  []Reading{{}, {Temp: 30}, {}, {}, {}, {Temp: 32}},
+		errs: []error{boom, nil, boom, boom, boom, nil}}
+	z := newZone(f, newSource(st, time.Second, 0))
+	ctx, t0 := context.Background(), time.Now()
+	at := func(d time.Duration) time.Time { return t0.Add(d) }
+	z.step(ctx, at(0))
+	if lastDuty(f) != duty(70) {
+		t.Fatalf("startup: %v", f.calls)
+	}
+	z.step(ctx, at(time.Second)) // first good reading: straight to 30 %, no hold
+	if lastDuty(f) != duty(30) {
+		t.Fatalf("leaving startup should skip the ramp: %v", f.calls)
+	}
+	for i := 2; i <= 4; i++ {
+		z.step(ctx, at(time.Duration(i)*time.Second))
+	}
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("failsafe: %v", f.calls)
+	}
+	// Recovered at 32 °C (37 %), but failsafe was real 100 %: hold, then ramp,
+	// so a flaky sensor can't make the fans hunt.
+	z.step(ctx, at(5*time.Second))
+	z.step(ctx, at(5*time.Second+time.Minute))
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("leaving failsafe should hold: %v", f.calls)
+	}
+	z.step(ctx, at(5*time.Second+3*time.Minute)) // 2 m hold, then 1 m at 10 %/min
+	if lastDuty(f) != duty(90) {
+		t.Fatalf("leaving failsafe should ramp after the hold: %v", f.calls)
+	}
+}
+
+func TestRecoveryReadingNotAveragedWithOldOnes(t *testing.T) {
+	boom := errors.New("boom")
+	st := &stubSensor{name: "disks", seq: []Reading{{Temp: 38}, {Temp: 38}, {}, {}, {}, {Temp: 44}},
+		errs: []error{nil, nil, boom, boom, boom, nil}}
+	s := newSource(st, time.Second, 0)
+	s.avg = window{size: 3}
+	for i := 0; i <= 5; i++ {
+		s.poll(context.Background())
+	}
+	// 44 °C alone → 79 %; averaged with the old 38s it would be 40 °C → 65 %.
+	if got := math.Round(s.demand); got != 79 {
+		t.Fatalf("recovery demand %.0f%%, want 79%% (not mixed with pre-failure average)", got)
+	}
+}
+
+func TestStuckLimitIndependentOfInterval(t *testing.T) {
+	f := &fakeRunner{}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{}), budget: 25 * time.Second}
+	z := newZone(f, newSource(&stubSensor{}, time.Minute, 0)) // fail_after 3 × 60 s = 3 min
+	z.sources[0].sensor = disk
+	z.async = true
+	ctx, t0 := context.Background(), time.Now()
+	z.clock = func() time.Time { return t0 }
+	z.step(ctx, t0)
+	<-disk.started
+	z.step(ctx, t0.Add(25*time.Second))
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("hung read on a 60 s source should fail safe at its 25 s read budget: %v", f.calls)
+	}
+	close(disk.release)
+	z.wg.Wait()
 }

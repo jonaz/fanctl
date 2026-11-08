@@ -29,11 +29,6 @@ type source struct {
 	maxDuty int // the zone's limits, for want()
 	startup int
 
-	// stuckMin is the least time a poll may run before it is failed safe:
-	// at least what one read can legitimately take (command timeouts), so
-	// one slow read just counts as one error instead of forcing max_duty.
-	stuckMin time.Duration
-
 	next     time.Time   // when to poll next; zero = poll now (zone loop only)
 	started  time.Time   // when the running async poll began (zone loop only)
 	inFlight atomic.Bool // an async poll is running
@@ -65,15 +60,18 @@ func (s *source) poll(ctx context.Context) {
 	// Latch the demand until the zone has seen it, so a quick follow-up
 	// poll can't replace a hot reading before it reaches the fans. Only
 	// real demand: startup/failsafe floors are already in the state.
-	if real, _ := s.current(); real > s.peak {
+	// An unseen failsafe isn't latched: the zone only holds max_duty for
+	// failsafes it actually acted on.
+	if real, _ := s.current(); s.state != stateFailsafe && real > s.peak {
 		s.peak = real
 	}
 }
 
-// failsafe demands max_duty until a good reading. The last real demand
-// is kept, so the zone's real ramp holds there instead of winding down
-// while nothing is measured; the average and hysteresis are cleared, so
-// the first reading after recovery isn't mixed with pre-failure ones.
+// failsafe demands max_duty until a good reading. Unlike the startup
+// floor this is real demand: the fans hold and ramp down from max_duty
+// after recovery, so a flaky sensor can't make them hunt. The average and
+// hysteresis are cleared, so the first reading after recovery isn't mixed
+// with pre-failure ones.
 func (s *source) failsafe(frag string) {
 	s.state, s.frag = stateFailsafe, frag
 	s.avg.reset()
@@ -166,6 +164,14 @@ func (s *source) want() (real, floor float64, frag string) {
 	return real, floor, s.frag
 }
 
+// readBudget is the longest one read of this source can legitimately take.
+func (s *source) readBudget() time.Duration {
+	if b, ok := s.sensor.(interface{ maxReadTime() time.Duration }); ok {
+		return b.maxReadTime() // e.g. disks: batches of smartctl
+	}
+	return readBudget(1)
+}
+
 func (s *source) current() (real, floor float64) {
 	switch s.state {
 	case stateOK:
@@ -173,7 +179,7 @@ func (s *source) current() (real, floor float64) {
 	case stateIdle:
 		return 0, 0
 	case stateFailsafe:
-		return s.demand, float64(s.maxDuty) // last real demand, kept
+		return float64(s.maxDuty), 0
 	default: // pending: partial readings may already ask for more
 		return s.demand, float64(s.startup)
 	}
@@ -246,10 +252,9 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, s := range z.sources {
-		limit := max(time.Duration(s.cfg.FailAfter)*s.cfg.Interval.Duration, s.stuckMin)
-		if m, ok := s.sensor.(interface{ maxReadTime() time.Duration }); ok {
-			limit = max(limit, m.maxReadTime()) // e.g. disks: batches of smartctl
-		}
+		// A read running longer than it can legitimately take is hung;
+		// independent of interval, so slow sources fail safe just as fast.
+		limit := s.readBudget()
 		if s.inFlight.Load() && now.Sub(s.started) >= limit {
 			s.markStuck(now.Sub(s.started))
 		}
