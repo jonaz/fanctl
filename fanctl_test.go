@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -245,7 +246,7 @@ func TestRampUpFastDownSlow(t *testing.T) {
 	if lastDuty(f) != duty(100) {
 		t.Fatalf("should hold during ramp_down_delay: %v", f.calls)
 	}
-	// Last high demand was at 1 s, so the hold ends at 2 m 1 s; about a
+	// The drop was first seen at 2 s, so the hold ends at 2 m 2 s; a
 	// minute of ramping at 10 %/min later → 90 %.
 	z.step(ctx, t0.Add(2*time.Second+3*time.Minute))
 	if lastDuty(f) != duty(90) {
@@ -312,7 +313,10 @@ func TestStartupAndFailsafe(t *testing.T) {
 	if lastDuty(f) != duty(100) {
 		t.Fatalf("failsafe should go to 100%%: %v", f.calls)
 	}
+	// Recovery: the drop is seen at 3 s, the ramp (no delay, huge rate)
+	// takes effect on the next tick.
 	z.step(ctx, t0.Add(3*time.Second))
+	z.step(ctx, t0.Add(4*time.Second))
 	if lastDuty(f) != duty(30) {
 		t.Fatalf("after recovery: %v", f.calls)
 	}
@@ -368,5 +372,158 @@ func TestBuildZonesOptionalGPU(t *testing.T) {
 	}
 	if n := len(zones[1].sources); n != 1 {
 		t.Fatalf("optional gpu should be skipped, got %d sources", n)
+	}
+}
+
+// blockingSensor blocks in Read until release is closed.
+type blockingSensor struct {
+	started chan struct{}
+	release chan struct{}
+	reads   atomic.Int32
+}
+
+func (b *blockingSensor) Name() string { return "disks" }
+func (b *blockingSensor) Read(ctx context.Context) (Reading, error) {
+	if b.reads.Add(1) == 1 {
+		close(b.started)
+	}
+	<-b.release
+	return Reading{Temp: 30}, nil
+}
+
+// signalSensor returns a fixed reading and signals each read.
+type signalSensor struct {
+	r    Reading
+	done chan struct{}
+}
+
+func (s *signalSensor) Name() string { return "gpu" }
+func (s *signalSensor) Read(context.Context) (Reading, error) {
+	defer func() { s.done <- struct{}{} }()
+	return s.r, nil
+}
+
+func TestSlowSourceDoesNotBlockZone(t *testing.T) {
+	f := &fakeRunner{}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
+	gpu := &signalSensor{r: Reading{Temp: 45}, done: make(chan struct{}, 10)}
+	z := newZone(f, newSource(&stubSensor{}, time.Minute, 0), newSource(&stubSensor{}, time.Second, 0))
+	z.sources[0].sensor, z.sources[1].sensor = disk, gpu
+	z.async = true
+	ctx, t0 := context.Background(), time.Now()
+
+	stepped := make(chan struct{})
+	go func() {
+		z.step(ctx, t0)
+		<-disk.started
+		<-gpu.done
+		z.step(ctx, t0.Add(time.Second)) // gpu polled again; disk still busy
+		<-gpu.done
+		close(stepped)
+	}()
+	select {
+	case <-stepped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("zone blocked on a slow source")
+	}
+	z.step(ctx, t0.Add(2*time.Second)) // uses the gpu result from the 1 s poll
+	// Disk still pending (startup 70 %), gpu 45 °C → 83 % wins.
+	if lastDuty(f) != duty(83) {
+		t.Fatalf("gpu demand should apply while disks hang: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(time.Minute)) // disk due again but still in flight
+	if n := disk.reads.Load(); n != 1 {
+		t.Fatalf("disk polled %d times while in flight, want 1", n)
+	}
+	close(disk.release)
+	z.wg.Wait()
+}
+
+func TestPartialReadingOnlyRaisesDemand(t *testing.T) {
+	partial := errors.New("/dev/sdb: exit status 2")
+	t.Run("keeps startup duty", func(t *testing.T) {
+		f := &fakeRunner{}
+		st := &stubSensor{name: "disks", seq: temps(34, 50), errs: []error{partial, partial}}
+		z := newZone(f, newSource(st, time.Second, 0))
+		ctx, t0 := context.Background(), time.Now()
+		z.step(ctx, t0) // 34 °C → 44 %, but the missing disk may be hot
+		if lastDuty(f) != duty(70) {
+			t.Fatalf("cool partial reading released startup duty: %v", f.calls)
+		}
+		z.step(ctx, t0.Add(time.Second)) // hotter partial reading still raises
+		if lastDuty(f) != duty(100) {
+			t.Fatalf("hot partial reading should raise demand: %v", f.calls)
+		}
+	})
+	t.Run("keeps previous demand", func(t *testing.T) {
+		f := &fakeRunner{}
+		st := &stubSensor{name: "disks", seq: temps(45, 31, 31), errs: []error{nil, partial, nil}}
+		z := newZone(f, newSource(st, time.Second, 0))
+		z.rampDelay, z.rampRate = 0, 1e6
+		ctx, t0 := context.Background(), time.Now()
+		for i := 0; i < 2; i++ {
+			z.step(ctx, t0.Add(time.Duration(i)*time.Second))
+			z.step(ctx, t0.Add(time.Duration(i)*time.Second+time.Millisecond)) // not due: no poll
+		}
+		if lastDuty(f) != duty(83) || len(f.calls) != 1 {
+			t.Fatalf("partial cool reading lowered demand: %v", f.calls)
+		}
+		z.step(ctx, t0.Add(2*time.Second)) // full reading: drop is allowed
+		z.step(ctx, t0.Add(3*time.Second))
+		if lastDuty(f) != duty(34) {
+			t.Fatalf("full reading should lower demand: %v", f.calls)
+		}
+	})
+}
+
+func TestIntervalNotRoundedToTick(t *testing.T) {
+	st := &stubSensor{name: "disks", seq: temps(35)}
+	z := newZone(&fakeRunner{}, newSource(st, 7*time.Second, 0))
+	z.tick = 5 * time.Second
+	t0 := time.Now()
+	for i := 0; i <= 14; i++ { // 0…70 s
+		z.step(context.Background(), t0.Add(time.Duration(i)*5*time.Second))
+	}
+	if st.i != 11 { // 70 s / 7 s + the first poll; was 15 (every tick)
+		t.Fatalf("polls %d, want 11", st.i)
+	}
+}
+
+func TestHoldStartsAtFirstDrop(t *testing.T) {
+	f := &fakeRunner{}
+	z := newZone(f, newSource(&stubSensor{name: "disks", seq: temps(50, 30)}, time.Minute, 0))
+	z.tick, z.rampDelay = time.Minute, 30*time.Second
+	ctx, t0 := context.Background(), time.Now()
+	z.step(ctx, t0) // 100 %
+	z.step(ctx, t0.Add(time.Minute))
+	if lastDuty(f) != duty(100) || len(f.calls) != 1 {
+		t.Fatalf("drop seen at 60 s must be held for 30 s: %v", f.calls)
+	}
+	// Hold ends at 90 s; 30 s of ramping at 10 %/min → 95 %.
+	z.step(ctx, t0.Add(2*time.Minute))
+	if lastDuty(f) != duty(95) {
+		t.Fatalf("ramp after hold: %v", f.calls)
+	}
+}
+
+func TestFailedSettleWriteIsRetried(t *testing.T) {
+	f := &fakeRunner{err: map[string]error{}}
+	// 40.3 °C → 66 %, then 32 °C → 37 %. Ramping 1 %/s with min_change 2
+	// sends 66, 64 … 38, and the final 1 % step to 37 via the settle rule.
+	z := newZone(f, newSource(&stubSensor{name: "disks", seq: temps(40.3, 32)}, time.Second, 0))
+	z.rampDelay, z.rampRate = 0, 60
+	set37 := "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x25"
+	f.err[set37] = errors.New("bmc busy")
+	ctx, t0 := context.Background(), time.Now()
+	for i := 0; i <= 30; i++ {
+		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
+	}
+	if f.calls[len(f.calls)-1] != set37 || z.duty != 38 {
+		t.Fatalf("expected a failed write of 37%% after 38%%: duty %d, %v", z.duty, f.calls)
+	}
+	delete(f.err, set37)
+	z.step(ctx, t0.Add(31*time.Second))
+	if z.duty != 37 {
+		t.Fatalf("failed settle write not retried: duty %d, %v", z.duty, f.calls)
 	}
 }

@@ -20,9 +20,12 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   disks every minute) and turns its temperature into a duty through a curve
   (linear between points). The zone re-evaluates at its fastest source's
   interval, using each source's latest value, and takes the **highest**
-  demand, clamped to `min_duty`…`max_duty`.
+  demand, clamped to `min_duty`…`max_duty`. Sources are read in the
+  background, so a slow or hung `smartctl` never delays the GPU or the fan
+  writes.
 - **Up fast, down slow.** A higher demand is applied at once. When demand
-  drops, the duty is held for `ramp_down_delay` (default 2 min), then lowered
+  drops, the duty is held for `ramp_down_delay` (default 2 min, counted from
+  when the drop is first seen), then lowered
   by at most `ramp_down_rate` % per minute (default 10) until it reaches the
   target. Fans react to heat immediately but don't hunt up and down.
 - `hysteresis` (°C, per source) ignores small temperature drops, so a disk
@@ -41,6 +44,8 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 - Until every source has given a good reading, the zone runs at
   `startup_duty` (default 70%), never at the minimum.
 - A single failed read keeps the source's last demand.
+- A partial reading (some disks unreadable) can only raise demand, never
+  lower it or release `startup_duty`: the missing disk may be the hot one.
 - A source that fails to read `fail_after` times in a row (default 3) demands
   `max_duty` until it recovers. This includes a single disk that stops
   answering: the fan wall goes to 100% and the log says which disk.
