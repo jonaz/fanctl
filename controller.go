@@ -29,6 +29,11 @@ type source struct {
 	maxDuty int // the zone's limits, for want()
 	startup int
 
+	// stuckMin is the least time a poll may run before it is failed safe:
+	// at least what one read can legitimately take (command timeouts), so
+	// one slow read just counts as one error instead of forcing max_duty.
+	stuckMin time.Duration
+
 	next     time.Time   // when to poll next; zero = poll now (zone loop only)
 	started  time.Time   // when the running async poll began (zone loop only)
 	inFlight atomic.Bool // an async poll is running
@@ -50,6 +55,12 @@ func (s *source) poll(ctx context.Context) {
 	r, err := s.sensor.Read(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Cleared under the lock, so markStuck can't fail safe a poll that
+	// has just delivered its result.
+	defer s.inFlight.Store(false)
+	if ctx.Err() != nil {
+		return // shutting down: a cancelled read is not a sensor failure
+	}
 	s.apply(r, err)
 	// Latch the demand until the zone has seen it, so a quick follow-up
 	// poll can't replace a hot reading before it reaches the fans. Only
@@ -64,8 +75,8 @@ func (s *source) poll(ctx context.Context) {
 func (s *source) markStuck(running time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state == stateFailsafe {
-		return
+	if !s.inFlight.Load() || s.state == stateFailsafe {
+		return // finished meanwhile, or already failed safe
 	}
 	s.state = stateFailsafe
 	s.frag = s.sensor.Name() + "=STUCK"
@@ -188,26 +199,18 @@ type zoneCtl struct {
 	tick    time.Duration    // loop period: the shortest source interval
 	async   bool             // poll in goroutines (set by loop); else inline
 	clock   func() time.Time // nil = time.Now; tests set a fake
-	// stuckMin is the least time a poll may run before it is failed safe:
-	// at least the command timeout, so one slow read just counts as one
-	// error instead of forcing max_duty.
-	stuckMin time.Duration
-	wg       sync.WaitGroup
-	done     chan struct{} // an async poll finished; nil = nobody listens
+	wg      sync.WaitGroup
+	done    chan struct{} // an async poll finished; nil = nobody listens
 
 	startup   int
 	rampDelay time.Duration
 	rampRate  float64 // % per minute
 
-	duty   int       // last duty sent, -1 = none yet
-	level  float64   // internal duty; ramps down smoothly between whole percents
-	dropAt time.Time // when demand first fell below level; zero = not ramping
-	forced bool      // level came from startup/failsafe, not a reading
-	// realLevel is the level real readings call for while forced, so
-	// leaving startup/failsafe resumes from it (hold and ramp included).
-	realLevel float64
-	lastStep  time.Time
-	lastSent  time.Time
+	duty     int       // last duty sent, -1 = none yet
+	level    float64   // internal duty; ramps down smoothly between whole percents
+	dropAt   time.Time // when demand first fell below level; zero = not ramping
+	lastStep time.Time
+	lastSent time.Time
 }
 
 func (z *zoneCtl) addSource(s *source) {
@@ -233,7 +236,7 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, s := range z.sources {
-		limit := max(time.Duration(s.cfg.FailAfter)*s.cfg.Interval.Duration, z.stuckMin)
+		limit := max(time.Duration(s.cfg.FailAfter)*s.cfg.Interval.Duration, s.stuckMin)
 		if s.inFlight.Load() && now.Sub(s.started) >= limit {
 			s.markStuck(now.Sub(s.started))
 		}
@@ -248,8 +251,7 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 		z.wg.Add(1)
 		go func(s *source) {
 			defer z.wg.Done()
-			s.poll(ctx)
-			s.inFlight.Store(false)
+			s.poll(ctx) // clears inFlight
 			if z.done != nil {
 				select {
 				case z.done <- struct{}{}:
@@ -261,50 +263,34 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 	}
 }
 
-// evaluate takes the highest demand and moves the fans toward it: up at
-// once, down only after ramp_down_delay and then at most ramp_down_rate %
-// per minute. Leaving startup or failsafe isn't a drop in heat, so it
-// goes straight to the target.
+// evaluate moves the fans toward the highest demand.
+//
+// z.level follows real readings only: up at once, down only after
+// ramp_down_delay and then at most ramp_down_rate % per minute. Startup and
+// failsafe demand is a floor on top of it, never part of the ramp, so
+// entering either can only raise the fans and leaving either continues
+// from wherever the real readings' ramp has got to.
 func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	if now.Before(z.lastStep) {
 		now = z.lastStep // never let the ramp see time run backwards
 	}
-	want, forcedWant, readWant := float64(z.cfg.MinDuty), 0.0, 0.0
+	readWant, floor := float64(z.cfg.MinDuty), 0.0
 	parts := make([]string, 0, len(z.sources))
 	for _, s := range z.sources {
 		w, forced, frag := s.want()
-		want = math.Max(want, w)
 		if forced {
-			forcedWant = math.Max(forcedWant, w)
+			floor = math.Max(floor, w)
 		} else {
 			readWant = math.Max(readWant, w)
 		}
 		parts = append(parts, frag)
 	}
-	target := float64(clampRound(want, z.cfg.MinDuty, z.cfg.MaxDuty))
-	forced := forcedWant > readWant && forcedWant > float64(z.cfg.MinDuty)
-
-	if forced {
-		if !z.forced { // entering startup/failsafe: remember the real level
-			z.realLevel = 0
-			if z.duty >= 0 {
-				z.realLevel = z.level
-			}
-		}
-		z.realLevel = math.Max(z.realLevel, readWant)
-	}
+	realTarget := float64(clampRound(readWant, z.cfg.MinDuty, z.cfg.MaxDuty))
+	target := float64(clampRound(math.Max(readWant, floor), z.cfg.MinDuty, z.cfg.MaxDuty))
 
 	switch {
-	case z.forced && !forced:
-		// Leaving startup/failsafe isn't a drop in heat: go to what the
-		// readings call for, and hold and ramp only from a real level.
-		z.level = math.Max(target, z.realLevel)
-		z.dropAt = time.Time{}
-		if z.level > target {
-			z.dropAt = now
-		}
-	case z.duty < 0 || target >= z.level || forced:
-		z.level = target
+	case z.duty < 0 || realTarget >= z.level:
+		z.level = realTarget
 		z.dropAt = time.Time{}
 	default:
 		// The hold starts when the drop is first seen, not at the last
@@ -319,12 +305,11 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 		if z.lastStep.After(from) {
 			from = z.lastStep
 		}
-		z.level = math.Max(target, z.level-z.rampRate*now.Sub(from).Minutes())
+		z.level = math.Max(realTarget, z.level-z.rampRate*now.Sub(from).Minutes())
 	}
-	z.forced = forced
 	z.lastStep = now
 
-	duty := clampRound(z.level, z.cfg.MinDuty, z.cfg.MaxDuty)
+	duty := clampRound(math.Max(z.level, floor), z.cfg.MinDuty, z.cfg.MaxDuty)
 	diff := duty - z.duty
 	if diff < 0 {
 		diff = -diff
@@ -379,6 +364,9 @@ func (z *zoneCtl) loop(ctx context.Context) {
 			// backwards for the ramp.
 			z.step(ctx, z.now())
 		case <-z.done:
+			if ctx.Err() != nil {
+				return // cancelled polls wake us on shutdown; don't write
+			}
 			z.evaluate(ctx, z.now())
 		}
 	}

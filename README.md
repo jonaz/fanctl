@@ -29,8 +29,9 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   when the drop is first seen), then lowered
   by at most `ramp_down_rate` % per minute (default 10) until it reaches the
   target. Fans react to heat immediately but don't hunt up and down.
-  Leaving `startup_duty` or failsafe is not a drop in heat, so it goes
-  straight to the curve's duty.
+  `startup_duty` and failsafe act as a floor on top of this: they can only
+  raise the fans, and when they end the duty continues from wherever the
+  real readings' hold and ramp have got to.
 - `hysteresis` (°C, per source) ignores small temperature drops, so a disk
   flickering between 40 and 41 °C doesn't move the fans. `smoothing` (moving
   average, default 1 = off) helps with spiky sensors such as the CPU.
@@ -51,8 +52,9 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 - A partial reading (some disks unreadable) can only raise demand, never
   lower it or release `startup_duty`: the missing disk may be the hot one.
 - A source that fails to read `fail_after` times in a row (default 3), or
-  whose read hangs for `fail_after` × `interval` (at least 25 s, so one slow
-  command just counts as one error), demands `max_duty` until it recovers. This includes a single disk that stops
+  whose read hangs for `fail_after` × `interval` (at least as long as one read
+  can legitimately take: 25 s, or 20 s per batch of 8 disks plus 5 s, so one
+  slow command just counts as one error), demands `max_duty` until it recovers. This includes a single disk that stops
   answering: the fan wall goes to 100% and the log says which disk.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.

@@ -727,7 +727,7 @@ func TestStuckLimitAtLeastCommandTimeout(t *testing.T) {
 	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
 	z := newZone(f, newSource(&stubSensor{}, time.Second, 0))
 	z.sources[0].sensor = disk
-	z.async, z.stuckMin = true, 25*time.Second
+	z.async, z.sources[0].stuckMin = true, 25*time.Second
 	ctx, t0 := context.Background(), time.Now()
 	z.clock = func() time.Time { return t0 }
 	z.step(ctx, t0)
@@ -834,5 +834,88 @@ func TestTimeNeverRunsBackwards(t *testing.T) {
 	z.evaluate(ctx, t0.Add(7*time.Second)) // stale tick timestamp
 	if z.level > before {
 		t.Fatalf("level rose from %.1f to %.1f on an older timestamp", before, z.level)
+	}
+}
+
+func TestFloorDoesNotBypassRealHold(t *testing.T) {
+	f := &fakeRunner{}
+	boom := errors.New("no disk temperatures")
+	// Disks pending (startup 70 %) for two polls, then cool.
+	disks := newSource(&stubSensor{name: "disks", seq: []Reading{{}, {}, {Temp: 30}}, errs: []error{boom, boom, nil}}, time.Second, 0)
+	gpu := newSource(&stubSensor{name: "gpu", seq: temps(45, 30)}, time.Second, 0) // 83 %, then 30 %
+	z := newZone(f, disks, gpu)
+	ctx, t0 := context.Background(), time.Now()
+	z.step(ctx, t0)
+	if lastDuty(f) != duty(83) {
+		t.Fatalf("start: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(time.Second)) // gpu dropped: hold 83, don't fall to the 70 % floor
+	if lastDuty(f) != duty(83) {
+		t.Fatalf("startup floor bypassed the hold: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(2*time.Second)) // disks leave pending
+	if lastDuty(f) != duty(83) || len(f.calls) != 1 {
+		t.Fatalf("leaving startup changed the duty: %v", f.calls)
+	}
+	// Hold from the drop at 1 s ends at 2 m 1 s; a minute at 10 %/min → 73 %.
+	z.step(ctx, t0.Add(time.Second+3*time.Minute))
+	if lastDuty(f) != duty(73) {
+		t.Fatalf("ramp after hold: %v", f.calls)
+	}
+}
+
+func TestFloorEnteredMidHoldOnlyRaises(t *testing.T) {
+	f := &fakeRunner{}
+	boom := errors.New("no disk temperatures")
+	// Disks idle, then a failed read (back to pending, 70 %), then idle again.
+	disks := newSource(&stubSensor{name: "disks", seq: []Reading{{Idle: true}, {Idle: true}, {}, {Idle: true}},
+		errs: []error{nil, nil, boom, nil}}, time.Second, 0)
+	cpu := newSource(&stubSensor{name: "cpu", seq: temps(48, 34)}, time.Second, 0) // 93 %, then 44 %
+	z := newZone(f, disks, cpu)
+	ctx, t0 := context.Background(), time.Now()
+	z.step(ctx, t0)
+	z.step(ctx, t0.Add(time.Second)) // cpu drop: holding 93
+	z.step(ctx, t0.Add(2*time.Second))
+	if lastDuty(f) != duty(93) {
+		t.Fatalf("entering startup mid-hold dropped the fans: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(3*time.Second)) // idle again
+	if lastDuty(f) != duty(93) || len(f.calls) != 1 {
+		t.Fatalf("leaving startup should not move the fans: %v", f.calls)
+	}
+}
+
+func TestMarkStuckIgnoresFinishedPoll(t *testing.T) {
+	s := newSource(&stubSensor{name: "disks", seq: temps(35)}, time.Second, 0)
+	s.maxDuty = 100
+	s.inFlight.Store(true)
+	s.poll(context.Background()) // delivers and clears inFlight under the lock
+	s.markStuck(time.Minute)     // the stuck check lost the race
+	if w, forced, _ := s.want(); forced || w == 100 {
+		t.Fatalf("finished poll was failed safe: want %.0f forced %v", w, forced)
+	}
+}
+
+func TestCancelledReadIsNotAFailure(t *testing.T) {
+	st := &stubSensor{name: "gpu", seq: []Reading{{}}, errs: []error{context.Canceled}}
+	s := newSource(st, time.Second, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.poll(ctx)
+	if s.failures != 0 || s.frag != "" {
+		t.Fatalf("cancelled read counted: failures %d frag %q", s.failures, s.frag)
+	}
+}
+
+func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
+	devs := make([]string, 12)
+	for i := range devs {
+		devs[i] = fmt.Sprintf("/dev/sd%c", 'a'+i)
+	}
+	if got, want := maxReadTime(&diskSensor{devices: devs}), 2*readTimeout+5*time.Second; got != want {
+		t.Fatalf("12 disks: %s, want %s", got, want)
+	}
+	if got, want := maxReadTime(&gpuSensor{}), readTimeout+5*time.Second; got != want {
+		t.Fatalf("gpu: %s, want %s", got, want)
 	}
 }
