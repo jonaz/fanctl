@@ -39,7 +39,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Zones) != 2 || c.Zones[1].Interval.Duration != 30*time.Second {
+	if len(c.Zones) != 2 || c.Zones[1].Sources[0].Interval.Duration != time.Minute {
 		t.Fatalf("unexpected config: %+v", c.Zones)
 	}
 }
@@ -156,14 +156,37 @@ func (s *stubSensor) Read(context.Context) (Reading, error) {
 	return s.seq[i], err
 }
 
+var testCurve = [][2]float64{{30, 30}, {50, 100}} // 3.5 % per °C
+
+func newSource(st *stubSensor, interval time.Duration, hyst float64) *source {
+	return &source{
+		cfg:      Source{Curve: testCurve, FailAfter: 3, Hysteresis: hyst},
+		sensor:   st,
+		interval: interval,
+		avg:      window{size: 1},
+	}
+}
+
 func newZone(f *fakeRunner, srcs ...*source) *zoneCtl {
 	return &zoneCtl{
-		cfg:     Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2},
-		sources: srcs,
-		ipmi:    &IPMI{run: f, bin: "ipmitool"},
-		reapply: 5 * time.Minute,
-		duty:    -1,
+		cfg:       Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2},
+		sources:   srcs,
+		ipmi:      &IPMI{run: f, bin: "ipmitool"},
+		reapply:   5 * time.Minute,
+		tick:      time.Second,
+		startup:   70,
+		rampDelay: 2 * time.Minute,
+		rampRate:  10,
+		duty:      -1,
 	}
+}
+
+func temps(ts ...float64) []Reading {
+	r := make([]Reading, len(ts))
+	for i, t := range ts {
+		r[i] = Reading{Temp: t}
+	}
+	return r
 }
 
 func lastDuty(f *fakeRunner) string {
@@ -174,17 +197,15 @@ func lastDuty(f *fakeRunner) string {
 	return p[len(p)-1]
 }
 
+func duty(n int) string { return fmt.Sprintf("0x%02x", n) }
+
 func TestZoneTakesHighestDemand(t *testing.T) {
 	f := &fakeRunner{}
-	curve := [][2]float64{{30, 30}, {50, 100}}
-	disks := &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: &stubSensor{name: "disks", seq: []Reading{{Temp: 35}}}, avg: window{size: 1}}
-	gpu := &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: &stubSensor{name: "gpu", seq: []Reading{{Temp: 45}}}, avg: window{size: 1}}
+	disks := newSource(&stubSensor{name: "disks", seq: temps(35)}, time.Second, 0)
+	gpu := newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0)
 	z := newZone(f, disks, gpu)
 	z.step(context.Background(), time.Now())
-	// gpu 45 °C → 30 + 15/20*70 = 82.5 → 83 % (0x53)
-	if got := lastDuty(f); got != "0x53" {
-		t.Fatalf("duty = %s, want 0x53; calls %v", got, f.calls)
-	}
+	// gpu 45 °C → 30 + 15*3.5 = 82.5 → 83 %
 	if f.calls[0] != "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53" {
 		t.Fatalf("raw command = %q", f.calls[0])
 	}
@@ -192,49 +213,129 @@ func TestZoneTakesHighestDemand(t *testing.T) {
 
 func TestZoneMinChangeAndReapply(t *testing.T) {
 	f := &fakeRunner{}
-	curve := [][2]float64{{30, 30}, {50, 100}}
-	st := &stubSensor{name: "disks", seq: []Reading{{Temp: 40}, {Temp: 40.2}, {Temp: 42}}}
-	z := newZone(f, &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: st, avg: window{size: 1}})
+	z := newZone(f, newSource(&stubSensor{name: "disks", seq: temps(40, 40.2, 42)}, time.Second, 0))
 	t0 := time.Now()
 	z.step(context.Background(), t0) // 65 %
 	z.step(context.Background(), t0.Add(time.Second))
 	if len(f.calls) != 1 {
 		t.Fatalf("tiny change should not be sent: %v", f.calls)
 	}
-	z.step(context.Background(), t0.Add(6*time.Minute)) // 72 %, and reapply due anyway
-	if len(f.calls) != 2 || lastDuty(f) != "0x48" {
+	z.step(context.Background(), t0.Add(2*time.Second)) // 72 %
+	if lastDuty(f) != duty(72) {
 		t.Fatalf("calls %v", f.calls)
+	}
+	z.step(context.Background(), t0.Add(6*time.Minute)) // unchanged, but reapply is due
+	if len(f.calls) != 3 || lastDuty(f) != duty(72) {
+		t.Fatalf("reapply: %v", f.calls)
 	}
 }
 
-func TestZoneFailsafeAndIdle(t *testing.T) {
+func TestRampUpFastDownSlow(t *testing.T) {
 	f := &fakeRunner{}
-	curve := [][2]float64{{30, 30}, {50, 100}}
+	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(40, 50, 30)}, time.Second, 0))
+	ctx, t0 := context.Background(), time.Now()
+	z.step(ctx, t0) // 65 %
+	z.step(ctx, t0.Add(time.Second))
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("rise should apply at once: %v", f.calls)
+	}
+	// Demand falls to 30 % from here on.
+	z.step(ctx, t0.Add(2*time.Second))
+	z.step(ctx, t0.Add(110*time.Second))
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("should hold during ramp_down_delay: %v", f.calls)
+	}
+	// Last high demand was at 1 s, so the hold ends at 2 m 1 s; about a
+	// minute of ramping at 10 %/min later → 90 %.
+	z.step(ctx, t0.Add(2*time.Second+3*time.Minute))
+	if lastDuty(f) != duty(90) {
+		t.Fatalf("ramp down: got %s, want 90%%; %v", lastDuty(f), f.calls)
+	}
+	// A rise during the ramp-down applies at once again.
+	z.sources[0].sensor = &stubSensor{name: "gpu", seq: temps(50)}
+	z.step(ctx, t0.Add(4*time.Minute))
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("rise during ramp-down: %v", f.calls)
+	}
+	// Long after: settles exactly on the target, not min_change short of it.
+	z.sources[0].sensor = &stubSensor{name: "gpu", seq: temps(30)}
+	for m := 5; m < 20; m++ {
+		z.step(ctx, t0.Add(time.Duration(m)*time.Minute))
+	}
+	if lastDuty(f) != duty(30) {
+		t.Fatalf("should settle at 30%%: %v", f.calls)
+	}
+}
+
+func TestHysteresis(t *testing.T) {
+	st := &stubSensor{name: "disks", seq: temps(41, 40, 41, 40, 39)}
+	s := newSource(st, time.Second, 1)
+	want := []float64{41, 41, 41, 41, 39}
+	for i, w := range want {
+		s.poll(context.Background())
+		if s.held != w {
+			t.Fatalf("poll %d: held %.0f, want %.0f", i, s.held, w)
+		}
+	}
+}
+
+func TestPerSourceInterval(t *testing.T) {
+	disks := &stubSensor{name: "disks", seq: temps(35)}
+	gpu := &stubSensor{name: "gpu", seq: temps(40)}
+	z := newZone(&fakeRunner{}, newSource(disks, time.Minute, 0), newSource(gpu, 5*time.Second, 0))
+	z.tick = 5 * time.Second
+	t0 := time.Now()
+	for i := 0; i <= 24; i++ { // two minutes, with up to 40 ms of ticker jitter
+		jitter := time.Duration(i%3) * 20 * time.Millisecond
+		z.step(context.Background(), t0.Add(time.Duration(i)*5*time.Second+jitter))
+	}
+	if disks.i != 3 || gpu.i != 25 {
+		t.Fatalf("reads: disks %d (want 3), gpu %d (want 25)", disks.i, gpu.i)
+	}
+}
+
+func TestStartupAndFailsafe(t *testing.T) {
+	f := &fakeRunner{}
 	boom := errors.New("boom")
 	st := &stubSensor{name: "gpu",
 		seq:  []Reading{{}, {}, {}, {Temp: 30}},
 		errs: []error{boom, boom, boom, nil}}
-	z := newZone(f, &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: st, avg: window{size: 1}})
-	ctx := context.Background()
-	t0 := time.Now()
+	z := newZone(f, newSource(st, time.Second, 0))
+	z.rampDelay, z.rampRate = 0, 1e6 // isolate from ramping
+	ctx, t0 := context.Background(), time.Now()
 	z.step(ctx, t0)
-	z.step(ctx, t0.Add(time.Second))
-	if lastDuty(f) != "0x1e" { // min duty while below fail threshold
-		t.Fatalf("before failsafe: %v", f.calls)
+	if lastDuty(f) != duty(70) {
+		t.Fatalf("no reading yet should use startup duty: %v", f.calls)
 	}
+	z.step(ctx, t0.Add(time.Second))
 	z.step(ctx, t0.Add(2*time.Second))
-	if lastDuty(f) != "0x64" {
+	if lastDuty(f) != duty(100) {
 		t.Fatalf("failsafe should go to 100%%: %v", f.calls)
 	}
-	z.step(ctx, t0.Add(3*time.Second)) // recovered
-	if lastDuty(f) != "0x1e" {
+	z.step(ctx, t0.Add(3*time.Second))
+	if lastDuty(f) != duty(30) {
 		t.Fatalf("after recovery: %v", f.calls)
 	}
+}
 
-	idle := &stubSensor{name: "disks", seq: []Reading{{Idle: true}}}
-	z2 := newZone(f, &source{cfg: Source{Curve: curve, FailAfter: 3}, sensor: idle, avg: window{size: 1}})
-	z2.step(ctx, t0)
-	if lastDuty(f) != "0x1e" {
+func TestTransientErrorKeepsLastDemand(t *testing.T) {
+	f := &fakeRunner{}
+	st := &stubSensor{name: "gpu", seq: []Reading{{Temp: 45}, {}}, errs: []error{nil, errors.New("timeout")}}
+	z := newZone(f, newSource(st, time.Second, 0))
+	z.rampDelay = 0
+	t0 := time.Now()
+	z.step(context.Background(), t0)
+	z.step(context.Background(), t0.Add(time.Minute))
+	if lastDuty(f) != duty(83) || len(f.calls) != 1 {
+		t.Fatalf("one failed read should keep 83%%: %v", f.calls)
+	}
+}
+
+func TestIdleDisksGiveMinDuty(t *testing.T) {
+	f := &fakeRunner{}
+	z := newZone(f, newSource(&stubSensor{name: "disks", seq: []Reading{{Idle: true}}}, time.Second, 0))
+	z.step(context.Background(), time.Now())
+	if lastDuty(f) != duty(30) {
 		t.Fatalf("idle disks should leave min duty: %v", f.calls)
 	}
 }
