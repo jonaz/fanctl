@@ -7,21 +7,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // fakeRunner returns canned output per command line and records calls.
+// Safe for concurrent use; the maps must not be changed during a Run.
 type fakeRunner struct {
 	out   map[string]string
 	err   map[string]error
+	mu    sync.Mutex
 	calls []string
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	key := strings.TrimSpace(name + " " + strings.Join(args, " "))
+	f.mu.Lock()
 	f.calls = append(f.calls, key)
+	f.mu.Unlock()
 	return []byte(f.out[key]), f.err[key]
 }
 
@@ -403,6 +408,13 @@ func (s *signalSensor) Read(context.Context) (Reading, error) {
 	return s.r, nil
 }
 
+// waitPollDone waits for an async poll to finish storing its result.
+func waitPollDone(s *source) {
+	for s.inFlight.Load() {
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestSlowSourceDoesNotBlockZone(t *testing.T) {
 	f := &fakeRunner{}
 	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
@@ -417,8 +429,10 @@ func TestSlowSourceDoesNotBlockZone(t *testing.T) {
 		z.step(ctx, t0)
 		<-disk.started
 		<-gpu.done
+		waitPollDone(z.sources[1])
 		z.step(ctx, t0.Add(time.Second)) // gpu polled again; disk still busy
 		<-gpu.done
+		waitPollDone(z.sources[1])
 		close(stepped)
 	}()
 	select {
@@ -525,5 +539,39 @@ func TestFailedSettleWriteIsRetried(t *testing.T) {
 	z.step(ctx, t0.Add(31*time.Second))
 	if z.duty != 37 {
 		t.Fatalf("failed settle write not retried: duty %d, %v", z.duty, f.calls)
+	}
+}
+
+// barrierRunner only answers once n calls are running at the same time.
+type barrierRunner struct {
+	n       int
+	mu      sync.Mutex
+	running int
+	all     chan struct{}
+}
+
+func (b *barrierRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	b.mu.Lock()
+	if b.running++; b.running == b.n {
+		close(b.all)
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.all:
+		return []byte(fmt.Sprintf(smartOK, 30+len(args[len(args)-1]))), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestDiskSensorReadsInParallel(t *testing.T) {
+	devs := []string{"/dev/sda", "/dev/sdb", "/dev/nvme0n1"}
+	b := &barrierRunner{n: len(devs), all: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := (&diskSensor{run: b, bin: "smartctl", devices: devs}).Read(ctx)
+	// 30 + len("/dev/nvme0n1") = 42: the hottest, last in order.
+	if err != nil || r.Temp != 42 || !strings.Contains(r.Detail, "/dev/nvme0n1") {
+		t.Fatalf("disks not read in parallel: %+v, %v", r, err)
 	}
 }

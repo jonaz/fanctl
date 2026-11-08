@@ -22,7 +22,7 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   interval, using each source's latest value, and takes the **highest**
   demand, clamped to `min_duty`…`max_duty`. Sources are read in the
   background, so a slow or hung `smartctl` never delays the GPU or the fan
-  writes.
+  writes, and all disks are queried in parallel.
 - **Up fast, down slow.** A higher demand is applied at once. When demand
   drops, the duty is held for `ramp_down_delay` (default 2 min, counted from
   when the drop is first seen), then lowered

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Reading is one sample from a source.
@@ -99,15 +100,33 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 		asleep      int
 		failed      []string
 	)
-	for _, dev := range devs {
-		t, sleeping, err := s.readOne(ctx, dev)
+	// Read all disks at once, so one hung disk costs a single smartctl
+	// timeout rather than one per disk queued behind it.
+	type result struct {
+		temp     float64
+		sleeping bool
+		err      error
+	}
+	res := make([]result, len(devs))
+	var wg sync.WaitGroup
+	for i, dev := range devs {
+		wg.Add(1)
+		go func(i int, dev string) {
+			defer wg.Done()
+			t, sleeping, err := s.readOne(ctx, dev)
+			res[i] = result{t, sleeping, err}
+		}(i, dev)
+	}
+	wg.Wait()
+	for i, r := range res {
+		dev := devs[i]
 		switch {
-		case err != nil:
-			failed = append(failed, fmt.Sprintf("%s: %v", dev, err))
-		case sleeping:
+		case r.err != nil:
+			failed = append(failed, fmt.Sprintf("%s: %v", dev, r.err))
+		case r.sleeping:
 			asleep++
-		case !found || t > best:
-			best, found, hottest = t, true, dev
+		case !found || r.temp > best:
+			best, found, hottest = r.temp, true, dev
 		}
 	}
 	var err error
