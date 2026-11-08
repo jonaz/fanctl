@@ -119,7 +119,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 				}
 				sen = &gpuSensor{run: run, bin: cfg.NvidiaSmi}
 			}
-			z.sources = append(z.sources, &source{cfg: sc, sensor: sen, interval: sc.Interval.Duration, avg: window{size: zc.Smoothing}})
+			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}})
 			if z.tick == 0 || sc.Interval.Duration < z.tick {
 				z.tick = sc.Interval.Duration
 			}
@@ -129,7 +129,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 		}
 		var polls []string
 		for _, s := range z.sources {
-			polls = append(polls, fmt.Sprintf("%s every %s", s.sensor.Name(), s.interval))
+			polls = append(polls, fmt.Sprintf("%s every %s", s.sensor.Name(), s.cfg.Interval.Duration))
 		}
 		log.Printf("zone %s: %s; startup %d%%, ramp down after %s at %.0f%%/min",
 			zc.Name, strings.Join(polls, ", "), z.startup, z.rampDelay, z.rampRate)

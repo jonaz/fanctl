@@ -67,6 +67,10 @@ func (s *cpuSensor) Read(_ context.Context) (Reading, error) {
 
 // ---- Disks: smartctl, without waking sleeping drives ----
 
+// maxParallelSmartctl caps concurrent smartctl processes on big boxes while
+// still keeping one hung disk from holding up the rest.
+const maxParallelSmartctl = 8
+
 type diskSensor struct {
 	run     Runner
 	bin     string
@@ -109,10 +113,13 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 	}
 	res := make([]result, len(devs))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxParallelSmartctl)
 	for i, dev := range devs {
 		wg.Add(1)
 		go func(i int, dev string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			t, sleeping, err := s.readOne(ctx, dev)
 			res[i] = result{t, sleeping, err}
 		}(i, dev)

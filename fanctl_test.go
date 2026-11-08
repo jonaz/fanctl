@@ -51,20 +51,32 @@ func TestExampleConfigLoads(t *testing.T) {
 }
 
 func TestValidateRejects(t *testing.T) {
-	bad := []Config{
-		{Zones: nil},
-		{Zones: []Zone{{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{40, 20}}}}}}},
-		{Zones: []Zone{{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{40, 20}, {30, 50}}}}}}},
-		{Zones: []Zone{{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "fan", Curve: [][2]float64{{1, 1}, {2, 2}}}}}}},
-		{Zones: []Zone{
-			{Name: "a", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{1, 1}, {2, 2}}}}},
-			{Name: "b", MaxDuty: 100, Sources: []Source{{Type: "cpu", Curve: [][2]float64{{1, 1}, {2, 2}}}}},
-		}},
+	ok := [][2]float64{{1, 1}, {2, 2}}
+	zone := func(name string, ipmi int, typ string, curve [][2]float64) Zone {
+		return Zone{Name: name, IpmiZone: ipmi, Sources: []Source{{Type: typ, Curve: curve}}}
 	}
-	for i, c := range bad {
-		if err := c.Validate(); err == nil {
-			t.Errorf("config %d: expected validation error", i)
+	bad := []struct {
+		want  string
+		zones []Zone
+	}{
+		{"no zones", nil},
+		{"at least 2 points", []Zone{zone("a", 0, "cpu", [][2]float64{{40, 20}})}},
+		{"must increase", []Zone{zone("a", 0, "cpu", [][2]float64{{40, 20}, {30, 50}})}},
+		{"unknown source type", []Zone{zone("a", 0, "fan", ok)}},
+		{"both use ipmi_zone", []Zone{zone("a", 0, "cpu", ok), zone("b", 0, "cpu", ok)}},
+	}
+	for i, b := range bad {
+		// Defaults first, as LoadConfig does, so each case reaches its check.
+		c := Config{Zones: b.zones}
+		c.applyDefaults()
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), b.want) {
+			t.Errorf("config %d: got %v, want error containing %q", i, err, b.want)
 		}
+	}
+	good := Config{Zones: []Zone{zone("a", 0, "cpu", ok), zone("b", 1, "gpu", ok)}}
+	good.applyDefaults()
+	if err := good.Validate(); err != nil {
+		t.Errorf("valid config rejected: %v", err)
 	}
 }
 
@@ -166,17 +178,15 @@ var testCurve = [][2]float64{{30, 30}, {50, 100}} // 3.5 % per °C
 
 func newSource(st *stubSensor, interval time.Duration, hyst float64) *source {
 	return &source{
-		cfg:      Source{Curve: testCurve, FailAfter: 3, Hysteresis: hyst},
-		sensor:   st,
-		interval: interval,
-		avg:      window{size: 1},
+		cfg:    Source{Curve: testCurve, FailAfter: 3, Hysteresis: hyst, Interval: Duration{interval}},
+		sensor: st,
+		avg:    window{size: 1},
 	}
 }
 
 func newZone(f *fakeRunner, srcs ...*source) *zoneCtl {
-	return &zoneCtl{
+	z := &zoneCtl{
 		cfg:       Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2},
-		sources:   srcs,
 		ipmi:      &IPMI{run: f, bin: "ipmitool"},
 		reapply:   5 * time.Minute,
 		tick:      time.Second,
@@ -185,6 +195,10 @@ func newZone(f *fakeRunner, srcs ...*source) *zoneCtl {
 		rampRate:  10,
 		duty:      -1,
 	}
+	for _, s := range srcs {
+		z.addSource(s)
+	}
+	return z
 }
 
 func temps(ts ...float64) []Reading {
@@ -318,10 +332,7 @@ func TestStartupAndFailsafe(t *testing.T) {
 	if lastDuty(f) != duty(100) {
 		t.Fatalf("failsafe should go to 100%%: %v", f.calls)
 	}
-	// Recovery: the drop is seen at 3 s, the ramp (no delay, huge rate)
-	// takes effect on the next tick.
 	z.step(ctx, t0.Add(3*time.Second))
-	z.step(ctx, t0.Add(4*time.Second))
 	if lastDuty(f) != duty(30) {
 		t.Fatalf("after recovery: %v", f.calls)
 	}
@@ -574,4 +585,137 @@ func TestDiskSensorReadsInParallel(t *testing.T) {
 	if err != nil || r.Temp != 42 || !strings.Contains(r.Detail, "/dev/nvme0n1") {
 		t.Fatalf("disks not read in parallel: %+v, %v", r, err)
 	}
+}
+
+func TestLeavingStartupOrFailsafeSkipsRamp(t *testing.T) {
+	boom := errors.New("boom")
+	f := &fakeRunner{}
+	// default hold (2 m) and rate (10 %/min) from newZone
+	st := &stubSensor{name: "disks",
+		seq:  []Reading{{}, {Temp: 30}, {}, {}, {}, {Temp: 32}},
+		errs: []error{boom, nil, boom, boom, boom, nil}}
+	z := newZone(f, newSource(st, time.Second, 0))
+	ctx, t0 := context.Background(), time.Now()
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	z.step(ctx, at(0))
+	if lastDuty(f) != duty(70) {
+		t.Fatalf("startup: %v", f.calls)
+	}
+	z.step(ctx, at(1)) // first good reading: straight to 30 %, no hold
+	if lastDuty(f) != duty(30) {
+		t.Fatalf("leaving startup should skip the ramp: %v", f.calls)
+	}
+	for i := 2; i <= 4; i++ {
+		z.step(ctx, at(i))
+	}
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("failsafe: %v", f.calls)
+	}
+	z.step(ctx, at(5)) // recovered at 32 °C → 37 %
+	if lastDuty(f) != duty(37) {
+		t.Fatalf("recovering from failsafe should skip the ramp: %v", f.calls)
+	}
+	// A real drop after that still holds.
+	z.sources[0].sensor = &stubSensor{name: "disks", seq: temps(30)}
+	z.step(ctx, at(6))
+	if lastDuty(f) != duty(37) {
+		t.Fatalf("real drop should hold: %v", f.calls)
+	}
+}
+
+func TestHotReadingNotLostToQuickRepoll(t *testing.T) {
+	f := &fakeRunner{}
+	st := &stubSensor{name: "cpu", seq: temps(30, 50, 30)}
+	z := newZone(f, newSource(st, time.Second, 0))
+	ctx := context.Background()
+	s := z.sources[0]
+	s.poll(ctx)
+	z.evaluate(ctx, time.Now()) // 30 %
+	// Two polls finish before the zone looks: hot, then cool.
+	s.poll(ctx)
+	s.poll(ctx)
+	z.evaluate(ctx, time.Now())
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("hot reading overwritten before use: %v", f.calls)
+	}
+}
+
+func TestLoopAppliesPollAsSoonAsItFinishes(t *testing.T) {
+	f := &fakeRunner{}
+	gate := make(chan struct{})
+	gpu := &gatedSensor{gate: gate, r: Reading{Temp: 45}}
+	z := newZone(f, newSource(&stubSensor{}, time.Hour, 0))
+	z.sources[0].sensor = gpu
+	z.tick = time.Hour // no second tick during the test
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { z.loop(ctx); close(stopped) }()
+	waitFor(t, f, duty(70)) // startup duty while the first poll runs
+	close(gate)
+	waitFor(t, f, duty(83)) // applied on completion, not an hour later
+	cancel()
+	<-stopped
+}
+
+func TestStuckPollFailsSafe(t *testing.T) {
+	f := &fakeRunner{}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
+	z := newZone(f, newSource(&stubSensor{}, time.Second, 0))
+	z.sources[0].sensor = disk
+	z.async = true
+	ctx, t0 := context.Background(), time.Now()
+	z.step(ctx, t0)
+	<-disk.started
+	z.step(ctx, t0.Add(2*time.Second))
+	if lastDuty(f) != duty(70) {
+		t.Fatalf("before fail_after × interval: %v", f.calls)
+	}
+	z.step(ctx, t0.Add(3*time.Second)) // fail_after 3 × 1 s
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("hung poll should fail safe: %v", f.calls)
+	}
+	close(disk.release)
+	z.wg.Wait()
+}
+
+func TestUnreadableDiskEndsIdle(t *testing.T) {
+	f := &fakeRunner{}
+	st := &stubSensor{name: "disks", seq: []Reading{{Idle: true}, {}}, errs: []error{nil, errors.New("no disk temperatures")}}
+	z := newZone(f, newSource(st, time.Second, 0))
+	t0 := time.Now()
+	z.step(context.Background(), t0)
+	z.step(context.Background(), t0.Add(time.Second))
+	if lastDuty(f) != duty(70) {
+		t.Fatalf("an unreadable disk among sleeping ones should get startup duty: %v", f.calls)
+	}
+}
+
+// gatedSensor answers once gate is closed.
+type gatedSensor struct {
+	gate chan struct{}
+	r    Reading
+}
+
+func (g *gatedSensor) Name() string { return "gpu" }
+func (g *gatedSensor) Read(context.Context) (Reading, error) {
+	<-g.gate
+	return g.r, nil
+}
+
+// waitFor waits until the last duty sent is d.
+func waitFor(t *testing.T, f *fakeRunner, d string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		got := lastDuty(f)
+		f.mu.Unlock()
+		if got == d {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t.Fatalf("duty %s never sent: %v", d, f.calls)
 }
