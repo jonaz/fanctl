@@ -7,7 +7,7 @@ Built for an X11SSM-F in a SilverStone RM420:
 | Zone | IPMI zone | Headers | Follows |
 | --- | --- | --- | --- |
 | `cpu` | 0 | FAN1–FAN4 | CPU package temperature (hwmon `coretemp`) |
-| `fanwall` | 1 | FANA | Hottest disk (smartctl) **or** GPU (nvidia-smi), whichever demands more |
+| `fanwall` | 1 | FANA | Hottest disk (smartctl), GPU (nvidia-smi) or sustained CPU load, whichever demands more |
 
 No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 `nvidia-smi`.
@@ -129,13 +129,21 @@ temperatures. Starting values:
 | CPU | 40→25, 55→35, 65→50, 75→75, 85→100 | E3-1230 v6 throttles near 100 °C |
 | Disks | 34→30, 37→40, 40→60, 43→85, 45→100 | Keep the hottest disk around 40 °C |
 | GPU | 45→30, 60→40, 70→60, 80→100 | The 2060 has its own fans; the wall feeds it fresh air |
+| CPU (fan wall) | 75→0, 80→50, 90→100 | The wall supplies the CPU cooler's intake air |
 
 Timing in the example:
 
 | Zone | Polling | Ramp down | Startup |
 | --- | --- | --- | --- |
 | `cpu` | CPU every 2 s, averaged over 3 | after 30 s, 20 %/min | 50% |
-| `fanwall` | GPU every 5 s, disks every 60 s, both 1 °C hysteresis | after 2 min, 5 %/min | 70% |
+| `fanwall` | GPU and CPU every 5 s, disks every 60 s (GPU and disks with 1 °C hysteresis) | after 2 min, 5 %/min | 70% |
+
+The `fanwall` zone also has a `cpu` source, because the fan wall supplies the
+intake air for the CPU cooler. Below 75 °C it asks for 0%, so the disks and GPU
+decide as before; under sustained load above that, the wall helps the CPU fan.
+The zone's 2-minute ramp-down delay keeps a short spike from leaving the wall
+running high for long. A source type can be used in several zones; each zone
+polls it on its own.
 
 Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_duty`,
 `min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
