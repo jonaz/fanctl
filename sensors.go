@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Reading is one sample from a source.
@@ -74,7 +76,17 @@ const maxParallelSmartctl = 8
 type diskSensor struct {
 	run     Runner
 	bin     string
-	devices []string // empty = autodetect each read
+	devices []string     // empty = autodetect each read
+	count   atomic.Int64 // disks in the latest (or running) Read
+}
+
+// maxReadTime is the longest one Read can legitimately take, plus a
+// margin: one command timeout per batch of maxParallelSmartctl disks.
+// Based on the latest detection, so disks that appear later count.
+func (s *diskSensor) maxReadTime() time.Duration {
+	n := max(int64(len(s.devices)), s.count.Load())
+	batches := max(1, (n+maxParallelSmartctl-1)/maxParallelSmartctl)
+	return time.Duration(batches)*readTimeout + 5*time.Second
 }
 
 func (s *diskSensor) Name() string { return "disks" }
@@ -98,6 +110,7 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 			return Reading{}, errors.New("no disks found")
 		}
 	}
+	s.count.Store(int64(len(devs)))
 	var (
 		best, found = 0.0, false
 		hottest     string

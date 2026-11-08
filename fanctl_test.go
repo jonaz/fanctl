@@ -65,6 +65,7 @@ func TestValidateRejects(t *testing.T) {
 		{"unknown source type", []Zone{zone("a", 0, "fan", ok)}},
 		{"both use ipmi_zone", []Zone{zone("a", 0, "cpu", ok), zone("b", 0, "cpu", ok)}},
 		{"fail_after", []Zone{{Name: "a", Sources: []Source{{Type: "cpu", Curve: ok, FailAfter: -1}}}}},
+		{"startup_duty must be between min_duty", []Zone{{Name: "a", MinDuty: 30, StartupDuty: ptr(20), Sources: []Source{{Type: "cpu", Curve: ok}}}}},
 	}
 	for i, b := range bad {
 		// Defaults first, as LoadConfig does, so each case reaches its check.
@@ -75,11 +76,17 @@ func TestValidateRejects(t *testing.T) {
 		}
 	}
 	good := Config{Zones: []Zone{zone("a", 0, "cpu", ok), zone("b", 1, "gpu", ok)}}
+	good.Zones[1].MinDuty = 80 // default startup_duty follows min_duty up
 	good.applyDefaults()
 	if err := good.Validate(); err != nil {
 		t.Errorf("valid config rejected: %v", err)
 	}
+	if got := *good.Zones[1].StartupDuty; got != 80 {
+		t.Errorf("default startup_duty with min_duty 80 = %d, want 80", got)
+	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func TestCPUSensor(t *testing.T) {
 	root := t.TempDir()
@@ -541,14 +548,18 @@ func TestFailedSettleWriteIsRetried(t *testing.T) {
 	set37 := "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x25"
 	f.err[set37] = errors.New("bmc busy")
 	ctx, t0 := context.Background(), time.Now()
+	now := t0
+	z.clock = func() time.Time { return now }
 	for i := 0; i <= 30; i++ {
-		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
+		now = t0.Add(time.Duration(i) * time.Second)
+		z.step(ctx, now)
 	}
 	if f.calls[len(f.calls)-1] != set37 || z.duty != 38 {
 		t.Fatalf("expected a failed write of 37%% after 38%%: duty %d, %v", z.duty, f.calls)
 	}
 	delete(f.err, set37)
-	z.step(ctx, t0.Add(31*time.Second))
+	now = t0.Add(31 * time.Second) // a tick later: retry allowed
+	z.step(ctx, now)
 	if z.duty != 37 {
 		t.Fatalf("failed settle write not retried: duty %d, %v", z.duty, f.calls)
 	}
@@ -891,8 +902,8 @@ func TestMarkStuckIgnoresFinishedPoll(t *testing.T) {
 	s.inFlight.Store(true)
 	s.poll(context.Background()) // delivers and clears inFlight under the lock
 	s.markStuck(time.Minute)     // the stuck check lost the race
-	if w, forced, _ := s.want(); forced || w == 100 {
-		t.Fatalf("finished poll was failed safe: want %.0f forced %v", w, forced)
+	if real, floor, _ := s.want(); floor != 0 || real == 0 {
+		t.Fatalf("finished poll was failed safe: real %.0f floor %.0f", real, floor)
 	}
 }
 
@@ -912,10 +923,92 @@ func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
 	for i := range devs {
 		devs[i] = fmt.Sprintf("/dev/sd%c", 'a'+i)
 	}
-	if got, want := maxReadTime(&diskSensor{devices: devs}), 2*readTimeout+5*time.Second; got != want {
+	if got, want := (&diskSensor{devices: devs}).maxReadTime(), 2*readTimeout+5*time.Second; got != want {
 		t.Fatalf("12 disks: %s, want %s", got, want)
 	}
-	if got, want := maxReadTime(&gpuSensor{}), readTimeout+5*time.Second; got != want {
-		t.Fatalf("gpu: %s, want %s", got, want)
+
+	// Autodetect: the limit follows the disks found by the latest read.
+	root := t.TempDir()
+	sysRoot = root
+	defer func() { sysRoot = "/" }()
+	f := &fakeRunner{out: map[string]string{}}
+	for _, d := range devs[:4] {
+		os.MkdirAll(filepath.Join(root, "sys/block", filepath.Base(d)), 0o755)
+		f.out[smartKey(d)] = fmt.Sprintf(smartOK, 35)
+	}
+	s := &diskSensor{run: f, bin: "smartctl"}
+	s.Read(context.Background())
+	if got, want := s.maxReadTime(), readTimeout+5*time.Second; got != want {
+		t.Fatalf("4 disks: %s, want %s", got, want)
+	}
+	for _, d := range devs[4:] { // hotplugged after start
+		os.MkdirAll(filepath.Join(root, "sys/block", filepath.Base(d)), 0o755)
+		f.out[smartKey(d)] = fmt.Sprintf(smartOK, 35)
+	}
+	s.Read(context.Background())
+	if got, want := s.maxReadTime(), 2*readTimeout+5*time.Second; got != want {
+		t.Fatalf("12 disks after hotplug: %s, want %s", got, want)
+	}
+}
+
+func TestFailsafeKeepsRealDemand(t *testing.T) {
+	f := &fakeRunner{}
+	boom := errors.New("boom")
+	st := &stubSensor{name: "gpu", seq: []Reading{{Temp: 45}, {}, {}, {}, {Temp: 30}},
+		errs: []error{nil, boom, boom, boom, nil}}
+	z := newZone(f, newSource(st, time.Second, 0))
+	ctx, t0 := context.Background(), time.Now()
+	for i := 0; i <= 3; i++ {
+		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
+	}
+	if lastDuty(f) != duty(100) {
+		t.Fatalf("failsafe: %v", f.calls)
+	}
+	// Ten minutes later the sensor recovers cool. The real demand was 83 %
+	// all along, so the drop starts now: hold at 83, not straight to 30.
+	z.step(ctx, t0.Add(10*time.Minute))
+	if lastDuty(f) != duty(83) {
+		t.Fatalf("failsafe advanced the ramp-down: %v", f.calls)
+	}
+}
+
+func TestRecoveryReadingNotAveragedWithOldOnes(t *testing.T) {
+	f := &fakeRunner{}
+	boom := errors.New("boom")
+	st := &stubSensor{name: "disks", seq: []Reading{{Temp: 38}, {Temp: 38}, {}, {}, {}, {Temp: 44}},
+		errs: []error{nil, nil, boom, boom, boom, nil}}
+	s := newSource(st, time.Second, 0)
+	s.avg = window{size: 3}
+	z := newZone(f, s)
+	ctx, t0 := context.Background(), time.Now()
+	for i := 0; i <= 5; i++ {
+		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
+	}
+	// 44 °C alone → 79 %; averaged with the old 38s it would be 40 °C → 65 %.
+	if lastDuty(f) != duty(79) {
+		t.Fatalf("recovery reading mixed with pre-failure average: %v", f.calls)
+	}
+}
+
+func TestFailedWriteRetriedAtMostEveryHalfTick(t *testing.T) {
+	f := &fakeRunner{err: map[string]error{}}
+	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0))
+	z.tick = 10 * time.Second
+	clock := time.Now()
+	z.clock = func() time.Time { return clock }
+	f.err["ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53"] = errors.New("bmc hung")
+	ctx := context.Background()
+	z.step(ctx, clock)
+	z.evaluate(ctx, clock.Add(time.Second)) // poll completions right after
+	clock = clock.Add(2 * time.Second)
+	z.evaluate(ctx, clock)
+	if len(f.calls) != 1 {
+		t.Fatalf("failed write retried on every evaluate: %v", f.calls)
+	}
+	clock = clock.Add(5 * time.Second) // half a tick after the failure
+	delete(f.err, "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53")
+	z.evaluate(ctx, clock)
+	if len(f.calls) != 2 || z.duty != 83 {
+		t.Fatalf("write not retried after half a tick: duty %d, %v", z.duty, f.calls)
 	}
 }

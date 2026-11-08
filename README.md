@@ -46,7 +46,8 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 ### Failsafes
 
 - Until every source has given a good reading, the zone runs at
-  `startup_duty` (default 70%), never at the minimum.
+  `startup_duty` (default 70%, or `min_duty` if higher; it may not be set
+  below `min_duty`).
 - A single failed read keeps the source's last demand. If the disks were all
   asleep and a read then fails, the zone goes back to `startup_duty`.
 - A partial reading (some disks unreadable) can only raise demand, never
@@ -54,8 +55,13 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 - A source that fails to read `fail_after` times in a row (default 3), or
   whose read hangs for `fail_after` × `interval` (at least as long as one read
   can legitimately take: 25 s, or 20 s per batch of 8 disks plus 5 s, so one
-  slow command just counts as one error), demands `max_duty` until it recovers. This includes a single disk that stops
-  answering: the fan wall goes to 100% and the log says which disk.
+  slow command just counts as one error), demands `max_duty` until it
+  recovers. This includes a single disk that stops answering: the fan wall
+  goes to 100% and the log says which disk. Its last real demand is kept
+  meanwhile, so recovering cool starts the normal hold and ramp from there,
+  and the first reading after recovery isn't averaged with old ones.
+- A failed fan write is retried at most every half tick, so a hung BMC
+  doesn't block the zone on every reading.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.
 - On shutdown it waits at most 2 s for running reads, so a hung disk can't

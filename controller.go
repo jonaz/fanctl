@@ -64,10 +64,20 @@ func (s *source) poll(ctx context.Context) {
 	s.apply(r, err)
 	// Latch the demand until the zone has seen it, so a quick follow-up
 	// poll can't replace a hot reading before it reaches the fans. Only
-	// real readings: startup/failsafe demand is already in the state.
-	if w, forced := s.current(); !forced && w > s.peak {
-		s.peak = w
+	// real demand: startup/failsafe floors are already in the state.
+	if real, _ := s.current(); real > s.peak {
+		s.peak = real
 	}
+}
+
+// failsafe demands max_duty until a good reading. The last real demand
+// is kept, so the zone's real ramp holds there instead of winding down
+// while nothing is measured; the average and hysteresis are cleared, so
+// the first reading after recovery isn't mixed with pre-failure ones.
+func (s *source) failsafe(frag string) {
+	s.state, s.frag = stateFailsafe, frag
+	s.avg.reset()
+	s.hasHeld = false
 }
 
 // markStuck fails a source safe whose poll has been running too long:
@@ -78,8 +88,7 @@ func (s *source) markStuck(running time.Duration) {
 	if !s.inFlight.Load() || s.state == stateFailsafe {
 		return // finished meanwhile, or already failed safe
 	}
-	s.state = stateFailsafe
-	s.frag = s.sensor.Name() + "=STUCK"
+	s.failsafe(s.sensor.Name() + "=STUCK")
 	log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), running.Round(time.Second))
 }
 
@@ -92,8 +101,7 @@ func (s *source) apply(r Reading, err error) {
 		s.failures = 0
 	}
 	if s.failures >= s.cfg.FailAfter {
-		s.state = stateFailsafe
-		s.frag = name + "=FAILSAFE"
+		s.failsafe(name + "=FAILSAFE")
 		return
 	}
 	// A failed read with no usable data keeps the previous state (or the
@@ -146,30 +154,28 @@ func (s *source) apply(r Reading, err error) {
 	}
 }
 
-// want returns the duty this source asks for: its current demand, or a
-// higher one from a poll the zone hasn't seen yet. forced is true when the
-// demand comes from startup or failsafe rather than a reading.
-func (s *source) want() (w float64, forced bool, frag string) {
+// want returns what this source asks for: real is the demand from
+// readings (raised by any poll the zone hasn't seen yet), floor is the
+// startup/failsafe minimum on top of it.
+func (s *source) want() (real, floor float64, frag string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	w, forced = s.current()
-	if s.peak > w {
-		w, forced = s.peak, false
-	}
+	real, floor = s.current()
+	real = math.Max(real, s.peak)
 	s.peak = -1
-	return w, forced, s.frag
+	return real, floor, s.frag
 }
 
-func (s *source) current() (float64, bool) {
+func (s *source) current() (real, floor float64) {
 	switch s.state {
 	case stateOK:
-		return s.demand, false
+		return s.demand, 0
 	case stateIdle:
-		return 0, false
+		return 0, 0
 	case stateFailsafe:
-		return float64(s.maxDuty), true
+		return s.demand, float64(s.maxDuty) // last real demand, kept
 	default: // pending: partial readings may already ask for more
-		return math.Max(float64(s.startup), s.demand), s.demand <= float64(s.startup)
+		return s.demand, float64(s.startup)
 	}
 }
 
@@ -211,6 +217,10 @@ type zoneCtl struct {
 	dropAt   time.Time // when demand first fell below level; zero = not ramping
 	lastStep time.Time
 	lastSent time.Time
+	// writeFailed is when SetDuty last failed; zero = last write worked.
+	// Retries wait half a tick, so a hung BMC isn't hit (and the loop
+	// blocked) on every poll completion.
+	writeFailed time.Time
 }
 
 func (z *zoneCtl) addSource(s *source) {
@@ -237,6 +247,9 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 	}
 	for _, s := range z.sources {
 		limit := max(time.Duration(s.cfg.FailAfter)*s.cfg.Interval.Duration, s.stuckMin)
+		if m, ok := s.sensor.(interface{ maxReadTime() time.Duration }); ok {
+			limit = max(limit, m.maxReadTime()) // e.g. disks: batches of smartctl
+		}
 		if s.inFlight.Load() && now.Sub(s.started) >= limit {
 			s.markStuck(now.Sub(s.started))
 		}
@@ -277,12 +290,8 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	readWant, floor := float64(z.cfg.MinDuty), 0.0
 	parts := make([]string, 0, len(z.sources))
 	for _, s := range z.sources {
-		w, forced, frag := s.want()
-		if forced {
-			floor = math.Max(floor, w)
-		} else {
-			readWant = math.Max(readWant, w)
-		}
+		real, fl, frag := s.want()
+		readWant, floor = math.Max(readWant, real), math.Max(floor, fl)
 		parts = append(parts, frag)
 	}
 	realTarget := float64(clampRound(readWant, z.cfg.MinDuty, z.cfg.MaxDuty))
@@ -322,13 +331,15 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 			// the last duty actually sent, so a failed write is retried
 			(z.duty > duty && float64(duty) == target))) ||
 		now.Sub(z.lastSent) >= z.reapply
-	if !send {
+	if !send || (!z.writeFailed.IsZero() && z.now().Sub(z.writeFailed) < z.tick/2) {
 		return
 	}
 	if err := z.ipmi.SetDuty(ctx, z.cfg.IpmiZone, duty); err != nil {
 		log.Printf("zone %s: %v", z.cfg.Name, err)
+		z.writeFailed = z.now()
 		return
 	}
+	z.writeFailed = time.Time{}
 	if changed {
 		log.Printf("zone %s: %d%% (target %d%%) [%s]", z.cfg.Name, duty, int(target), strings.Join(parts, " "))
 	}
@@ -362,6 +373,9 @@ func (z *zoneCtl) loop(ctx context.Context) {
 			// Not the tick's own timestamp: a buffered tick can be older
 			// than a completion already handled, and time must not go
 			// backwards for the ramp.
+			if ctx.Err() != nil {
+				return // a tick buffered at shutdown: no new polls or writes
+			}
 			z.step(ctx, z.now())
 		case <-z.done:
 			if ctx.Err() != nil {

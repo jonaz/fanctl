@@ -81,20 +81,6 @@ func main() {
 // readTimeout bounds each external command (smartctl, nvidia-smi, ipmitool).
 const readTimeout = 20 * time.Second
 
-// maxReadTime is the longest one Read can legitimately take, plus a margin.
-// Disks run in batches of maxParallelSmartctl, each up to readTimeout.
-func maxReadTime(sen Sensor) time.Duration {
-	batches := 1
-	if d, ok := sen.(*diskSensor); ok {
-		n := len(d.devices)
-		if n == 0 {
-			n = len(detectDisks()) // autodetect: count today's disks
-		}
-		batches = max(1, (n+maxParallelSmartctl-1)/maxParallelSmartctl)
-	}
-	return time.Duration(batches)*readTimeout + 5*time.Second
-}
-
 type lookPathFunc func(string) (string, error)
 
 func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*zoneCtl, error) {
@@ -136,7 +122,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 				}
 				sen = &gpuSensor{run: run, bin: cfg.NvidiaSmi}
 			}
-			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}, stuckMin: maxReadTime(sen)})
+			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}, stuckMin: readTimeout + 5*time.Second})
 			if z.tick == 0 || sc.Interval.Duration < z.tick {
 				z.tick = sc.Interval.Duration
 			}
