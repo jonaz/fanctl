@@ -51,11 +51,13 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 - A partial reading (some disks unreadable) can only raise demand, never
   lower it or release `startup_duty`: the missing disk may be the hot one.
 - A source that fails to read `fail_after` times in a row (default 3), or
-  whose read hangs for `fail_after` × `interval`, demands `max_duty` until it
-  recovers. This includes a single disk that stops
+  whose read hangs for `fail_after` × `interval` (at least 25 s, so one slow
+  command just counts as one error), demands `max_duty` until it recovers. This includes a single disk that stops
   answering: the fan wall goes to 100% and the log says which disk.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.
+- On shutdown it waits at most 2 s for running reads, so a hung disk can't
+  stop the BMC fan mode being restored.
 - If fanctl dies, systemd restarts it within 5 s. If it is stopped, the BMC
   gets control back.
 

@@ -189,6 +189,9 @@ func (c *Config) Validate() error {
 			if s.Interval.Duration < 0 || s.Hysteresis < 0 {
 				return fmt.Errorf("zone %q source %s: interval and hysteresis must not be negative", z.Name, s.Type)
 			}
+			if s.FailAfter < 1 {
+				return fmt.Errorf("zone %q source %s: fail_after must be at least 1", z.Name, s.Type)
+			}
 			switch s.Type {
 			case "cpu", "disks", "gpu":
 			default:

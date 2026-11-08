@@ -34,7 +34,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	run := execRunner{timeout: 20 * time.Second}
+	run := execRunner{timeout: readTimeout}
 	ipmi := &IPMI{run: run, bin: cfg.Ipmitool, dryRun: *dryRun || *once}
 
 	zones, err := buildZones(cfg, run, ipmi, exec.LookPath)
@@ -78,6 +78,9 @@ func main() {
 	}
 }
 
+// readTimeout bounds each external command (smartctl, nvidia-smi, ipmitool).
+const readTimeout = 20 * time.Second
+
 type lookPathFunc func(string) (string, error)
 
 func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*zoneCtl, error) {
@@ -91,6 +94,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 			rampDelay: zc.RampDownDelay.Duration,
 			rampRate:  *zc.RampDownRate,
 			duty:      -1,
+			stuckMin:  readTimeout + 5*time.Second,
 		}
 		for _, sc := range zc.Sources {
 			var sen Sensor

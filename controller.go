@@ -52,8 +52,9 @@ func (s *source) poll(ctx context.Context) {
 	defer s.mu.Unlock()
 	s.apply(r, err)
 	// Latch the demand until the zone has seen it, so a quick follow-up
-	// poll can't replace a hot reading before it reaches the fans.
-	if w, _ := s.current(); w > s.peak {
+	// poll can't replace a hot reading before it reaches the fans. Only
+	// real readings: startup/failsafe demand is already in the state.
+	if w, forced := s.current(); !forced && w > s.peak {
 		s.peak = w
 	}
 }
@@ -102,7 +103,9 @@ func (s *source) apply(r Reading, err error) {
 		d := Interpolate(s.cfg.Curve, r.Temp)
 		switch {
 		case s.state == stateIdle:
-			s.state, s.demand = stateOK, d
+			// Coming out of "all asleep" with a disk unreadable: that
+			// disk may be hot, so the startup floor applies again.
+			s.state, s.demand = statePending, d
 		case d > s.demand:
 			s.demand = d
 		}
@@ -140,7 +143,7 @@ func (s *source) want() (w float64, forced bool, frag string) {
 	defer s.mu.Unlock()
 	w, forced = s.current()
 	if s.peak > w {
-		w = s.peak
+		w, forced = s.peak, false
 	}
 	s.peak = -1
 	return w, forced, s.frag
@@ -182,21 +185,29 @@ type zoneCtl struct {
 	sources []*source
 	ipmi    *IPMI
 	reapply time.Duration
-	tick    time.Duration // loop period: the shortest source interval
-	async   bool          // poll in goroutines (set by loop); else inline
-	wg      sync.WaitGroup
-	done    chan struct{} // an async poll finished; nil = nobody listens
+	tick    time.Duration    // loop period: the shortest source interval
+	async   bool             // poll in goroutines (set by loop); else inline
+	clock   func() time.Time // nil = time.Now; tests set a fake
+	// stuckMin is the least time a poll may run before it is failed safe:
+	// at least the command timeout, so one slow read just counts as one
+	// error instead of forcing max_duty.
+	stuckMin time.Duration
+	wg       sync.WaitGroup
+	done     chan struct{} // an async poll finished; nil = nobody listens
 
 	startup   int
 	rampDelay time.Duration
 	rampRate  float64 // % per minute
 
-	duty     int       // last duty sent, -1 = none yet
-	level    float64   // internal duty; ramps down smoothly between whole percents
-	dropAt   time.Time // when demand first fell below level; zero = not ramping
-	forced   bool      // level came from startup/failsafe, not a reading
-	lastStep time.Time
-	lastSent time.Time
+	duty   int       // last duty sent, -1 = none yet
+	level  float64   // internal duty; ramps down smoothly between whole percents
+	dropAt time.Time // when demand first fell below level; zero = not ramping
+	forced bool      // level came from startup/failsafe, not a reading
+	// realLevel is the level real readings call for while forced, so
+	// leaving startup/failsafe resumes from it (hold and ramp included).
+	realLevel float64
+	lastStep  time.Time
+	lastSent  time.Time
 }
 
 func (z *zoneCtl) addSource(s *source) {
@@ -222,17 +233,18 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, s := range z.sources {
-		limit := time.Duration(s.cfg.FailAfter) * s.cfg.Interval.Duration
+		limit := max(time.Duration(s.cfg.FailAfter)*s.cfg.Interval.Duration, z.stuckMin)
 		if s.inFlight.Load() && now.Sub(s.started) >= limit {
 			s.markStuck(now.Sub(s.started))
 		}
 	}
 	z.evaluate(ctx, now)
+	launched := z.now() // after evaluate: a slow fan write isn't read time
 	for _, s := range z.sources {
 		if !s.due(now, z.tick) || !s.inFlight.CompareAndSwap(false, true) {
 			continue // not due, or the previous poll is still running
 		}
-		s.started = now
+		s.started = launched
 		z.wg.Add(1)
 		go func(s *source) {
 			defer z.wg.Done()
@@ -254,6 +266,9 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 // per minute. Leaving startup or failsafe isn't a drop in heat, so it
 // goes straight to the target.
 func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
+	if now.Before(z.lastStep) {
+		now = z.lastStep // never let the ramp see time run backwards
+	}
 	want, forcedWant, readWant := float64(z.cfg.MinDuty), 0.0, 0.0
 	parts := make([]string, 0, len(z.sources))
 	for _, s := range z.sources {
@@ -269,11 +284,28 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	target := float64(clampRound(want, z.cfg.MinDuty, z.cfg.MaxDuty))
 	forced := forcedWant > readWant && forcedWant > float64(z.cfg.MinDuty)
 
+	if forced {
+		if !z.forced { // entering startup/failsafe: remember the real level
+			z.realLevel = 0
+			if z.duty >= 0 {
+				z.realLevel = z.level
+			}
+		}
+		z.realLevel = math.Max(z.realLevel, readWant)
+	}
+
 	switch {
-	case z.duty < 0 || target >= z.level || z.forced:
+	case z.forced && !forced:
+		// Leaving startup/failsafe isn't a drop in heat: go to what the
+		// readings call for, and hold and ramp only from a real level.
+		z.level = math.Max(target, z.realLevel)
+		z.dropAt = time.Time{}
+		if z.level > target {
+			z.dropAt = now
+		}
+	case z.duty < 0 || target >= z.level || forced:
 		z.level = target
 		z.dropAt = time.Time{}
-		z.forced = forced
 	default:
 		// The hold starts when the drop is first seen, not at the last
 		// high reading, so long ticks can't eat into it.
@@ -289,6 +321,7 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 		}
 		z.level = math.Max(target, z.level-z.rampRate*now.Sub(from).Minutes())
 	}
+	z.forced = forced
 	z.lastStep = now
 
 	duty := clampRound(z.level, z.cfg.MinDuty, z.cfg.MaxDuty)
@@ -317,21 +350,49 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	z.duty, z.lastSent = duty, now
 }
 
+func (z *zoneCtl) now() time.Time {
+	if z.clock != nil {
+		return z.clock()
+	}
+	return time.Now()
+}
+
+// shutdownWait bounds how long loop waits for running polls on exit. A
+// read stuck in the kernel (a disk in D state) never returns, and waiting
+// for it would keep main from restoring the BMC fan mode.
+const shutdownWait = 2 * time.Second
+
 func (z *zoneCtl) loop(ctx context.Context) {
 	z.async = true
 	z.done = make(chan struct{}, 1)
-	defer z.wg.Wait()
-	z.step(ctx, time.Now())
+	defer z.waitPolls(shutdownWait)
+	z.step(ctx, z.now())
 	t := time.NewTicker(z.tick)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-t.C:
-			z.step(ctx, now)
+		case <-t.C:
+			// Not the tick's own timestamp: a buffered tick can be older
+			// than a completion already handled, and time must not go
+			// backwards for the ramp.
+			z.step(ctx, z.now())
 		case <-z.done:
-			z.evaluate(ctx, time.Now())
+			z.evaluate(ctx, z.now())
 		}
+	}
+}
+
+// waitPolls waits for running polls, at most d. Reports whether all ended.
+func (z *zoneCtl) waitPolls(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { z.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		log.Printf("zone %s: polls still running at shutdown, not waiting", z.cfg.Name)
+		return false
 	}
 }
