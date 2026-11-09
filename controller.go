@@ -14,8 +14,8 @@ import (
 // and the ramp. It decides when each source is due, starts the read in a
 // goroutine of its own and gets the result back on a channel; the read
 // goroutine touches nothing else. So there is no lock on source state, at
-// most one read per source is ever in flight, and every result is
-// evaluated as it lands. Fan writes run in a separate writer goroutine
+// most one live read per source is ever in flight (plus at most one stuck
+// one it gave up on), and every result is evaluated as it lands. Fan writes run in a separate writer goroutine
 // (a hung BMC must not stall polling), fed through a mailbox of one.
 //
 // Time: everything reads time.Now(). Tests run under testing/synctest, so
@@ -50,6 +50,9 @@ type source struct {
 	next      time.Time // when the next poll is due; zero = at once
 	inFlight  bool
 	startedAt time.Time
+	gen       int                // numbers reads, so an abandoned one's result is known
+	cancel    context.CancelFunc // cancels the in-flight read
+	abandoned bool               // a stuck read given up on is still running
 }
 
 // apply folds one read into the source's state. Pure apart from logging:
@@ -58,7 +61,8 @@ type source struct {
 //	read          | effect
 //	--------------+--------------------------------------------------------
 //	failed (err)  | keep last demand; ends idle (back to startup floor)
-//	partial       | may only raise demand; ends idle; never releases startup
+//	partial       | may only raise demand; ends idle; never releases startup;
+//	              | when OK and hotter than held, also enters average and hold
 //	idle          | no demand
 //	ok            | demand from the curve, after smoothing and hysteresis
 //
@@ -88,9 +92,13 @@ func (s *source) apply(r Reading, err error) {
 		s.endIdle()
 		s.frag = name + "=err"
 	case r.Partial != nil:
-		// The unreadable part could be the hottest: only raise, and stay
-		// out of the average and the hysteresis.
+		// The unreadable part could be the hottest: only raise. A reading
+		// above what is held also enters the average and the hold, so the
+		// next full reading carries on from it rather than from before.
 		s.endIdle()
+		if s.state == stateOK && r.Temp > s.held {
+			s.held = math.Max(s.held, s.avg.add(r.Temp))
+		}
 		s.demand = math.Max(s.demand, Interpolate(s.cfg.Curve, r.Temp))
 		s.frag = fmt.Sprintf("%s=%.1f°C→%d%%(partial)", name, r.Temp, int(math.Round(s.demand)))
 	case r.Idle:
@@ -282,7 +290,8 @@ type zoneCtl struct {
 	tick    time.Duration  // longest the loop sleeps without evaluating; 0 = evalTick
 	wg      sync.WaitGroup // reads and the writer
 
-	ramp ramp // owned by the loop
+	ramp     ramp      // owned by the loop
+	lastEval time.Time // owned by the loop: when evaluate last ran
 
 	// The mailbox from evaluate to the writer.
 	mu     sync.Mutex
@@ -409,8 +418,15 @@ const shutdownWait = 2 * time.Second
 
 // evalTick is the longest the loop goes without evaluating, so holds and
 // ramp-downs move on time even in a zone whose sources poll every minute.
-// Evaluating is cheap: the writer only talks to the BMC when it must.
+// Otherwise it evaluates only when a source's state changed.
 const evalTick = time.Second
+
+func (z *zoneCtl) evalEvery() time.Duration {
+	if z.tick == 0 {
+		return evalTick
+	}
+	return z.tick
+}
 
 // minWait is the shortest the loop sleeps between passes.
 const minWait = time.Millisecond
@@ -418,6 +434,7 @@ const minWait = time.Millisecond
 // pollResult carries a finished read back to the loop.
 type pollResult struct {
 	s   *source
+	gen int
 	r   Reading
 	err error
 }
@@ -430,6 +447,7 @@ func (z *zoneCtl) loop(ctx context.Context) {
 	defer z.waitWorkers(shutdownWait)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	changed := true // the first pass puts the startup duty on at once
 	for {
 		// However the loop woke (a tick or a result can race the cancel),
 		// a pass never starts at shutdown: no more reads or writes.
@@ -437,15 +455,24 @@ func (z *zoneCtl) loop(ctx context.Context) {
 			return
 		}
 		now := time.Now()
-		z.checkStuck(now)
-		z.evaluate(ctx, now) // the first pass puts the startup duty on at once
+		if z.checkStuck(now) {
+			changed = true
+		}
+		if changed || !now.Before(z.lastEval.Add(z.evalEvery())) {
+			z.evaluate(ctx, now)
+			z.lastEval, changed = now, false
+		}
 		for _, s := range z.claimDue(now) {
+			rctx, cancel := context.WithCancel(ctx)
+			s.gen++
+			s.cancel = cancel
+			gen := s.gen
 			z.wg.Add(1)
 			go func() {
 				defer z.wg.Done()
-				r, err := s.sensor.Read(ctx)
+				r, err := s.sensor.Read(rctx)
 				select {
-				case results <- pollResult{s, r, err}:
+				case results <- pollResult{s, gen, r, err}:
 				case <-ctx.Done():
 				}
 			}()
@@ -456,13 +483,35 @@ func (z *zoneCtl) loop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 		case res := <-results:
-			res.s.inFlight = false
-			if ctx.Err() == nil { // a cancelled read is not a sensor failure
-				res.s.apply(res.r, res.err)
+			if z.land(ctx, res) {
+				changed = true
 			}
 		case <-timer.C:
 		}
 	}
+}
+
+// land takes a finished read: the live one is applied, an abandoned one
+// only frees its slot. Reports whether the source's state may have changed.
+func (z *zoneCtl) land(ctx context.Context, res pollResult) bool {
+	s := res.s
+	if res.gen != s.gen || !s.inFlight {
+		// The stuck read given up on: its result is stale. With nothing
+		// else in flight, poll again at once.
+		s.abandoned = false
+		log.Printf("%s: stuck read ended after all", s.sensor.Name())
+		if !s.inFlight {
+			s.next = time.Time{}
+		}
+		return false
+	}
+	s.inFlight = false
+	s.cancel()
+	if ctx.Err() != nil { // a cancelled read is not a sensor failure
+		return false
+	}
+	s.apply(res.r, res.err)
+	return true
 }
 
 // claimDue marks each source that is due and not already being read as in
@@ -498,28 +547,42 @@ func nextSlot(prev, now time.Time, interval time.Duration) time.Time {
 // checkStuck fails safe any source whose in-flight read has outlived its
 // stuck limit: failures only count when a read returns, and a hung one
 // never does. The limit is looked up each time, so disks detected during
-// the read extend it.
-func (z *zoneCtl) checkStuck(now time.Time) {
+// the read extend it. Reports whether any source failed safe.
+//
+// The stuck read is then given up on (cancelled, and its result ignored if
+// it ever comes), so the next poll can start on schedule and the source can
+// recover even if that read never returns. Only one at a time: while one
+// is still running, a second stuck read is waited for, so a disk that
+// hangs every read can't pile up hung processes.
+func (z *zoneCtl) checkStuck(now time.Time) bool {
+	failed := false
 	for _, s := range z.sources {
-		// Already failed safe (by this read or by fail_after): a source in
-		// flight can't leave failsafe, as only a landed read does that.
-		if !s.inFlight || now.Before(s.stuckAt()) || s.state == stateFailsafe {
+		if !s.inFlight || now.Before(s.stuckAt()) {
 			continue
 		}
-		s.failsafe(s.sensor.Name() + "=STUCK")
-		log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), now.Sub(s.startedAt).Round(time.Second))
+		// Already failed safe (by this read or by fail_after): it stays so
+		// until a read lands, so the logged reason is kept.
+		if s.state != stateFailsafe {
+			s.failsafe(s.sensor.Name() + "=STUCK")
+			log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), now.Sub(s.startedAt).Round(time.Second))
+			failed = true
+		}
+		if !s.abandoned {
+			s.abandoned, s.inFlight = true, false
+			if s.cancel != nil {
+				s.cancel()
+			}
+		}
 	}
+	return failed
 }
 
 // nextWake is when the loop must next look: the next poll due, the next
 // read that could turn stuck, or the evaluate tick, whichever is first.
-// A read already past its stuck deadline has nothing more to wake for.
+// A read already past its stuck deadline has nothing more to wake for
+// (one that can't be given up on yet waits for the abandoned one to land).
 func (z *zoneCtl) nextWake(now time.Time) time.Time {
-	tick := z.tick
-	if tick == 0 {
-		tick = evalTick
-	}
-	wake := now.Add(tick)
+	wake := z.lastEval.Add(z.evalEvery())
 	for _, s := range z.sources {
 		at := s.next
 		if s.inFlight {

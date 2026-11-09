@@ -19,7 +19,8 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 - Every source is polled on its own `interval` (the GPU every few seconds, the
   disks every minute) and turns its temperature into a duty through a curve
   (linear between points). The zone re-evaluates every second and as soon
-  as any reading arrives, using each source's latest value; it takes the
+  as any reading arrives (and only then, or when a read turns stuck),
+  using each source's latest value; it takes the
   **highest** demand, clamped to `min_duty`…`max_duty`. Each read runs in
   the background, at most one per source at a time, so a slow or hung
   `smartctl` never delays the GPU or the fan writes, and disks are
@@ -56,11 +57,17 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   asleep and a read then fails, the zone goes back to `startup_duty`.
 - A partial reading (some disks unreadable) can only raise demand, never
   lower it or release `startup_duty`: the missing disk may be the hot one.
-  It counts as a failed read towards `fail_after`.
+  One hotter than the current reading also enters `smoothing` and
+  `hysteresis`, so the next full reading carries on from it. It counts as
+  a failed read towards `fail_after`.
+- Output from a command that was killed (timeout) or whose stdout was held
+  open by something it left behind is never used, even if it parses.
 - A source that fails to read `fail_after` times in a row (default 3), or
   whose read runs longer than it legitimately can (25 s, or 20 s per batch of
   8 disks plus 5 s, checked on time whatever the poll interval), demands `max_duty` until it
-  recovers. This includes a single disk that stops answering: the fan wall
+  recovers. A stuck read is given up on, so the next poll still runs and
+  can recover the source; while it keeps hanging, at most one more read is
+  started. This includes a single disk that stops answering: the fan wall
   goes to 100% and the log says which disk. The first reading after
   recovery isn't averaged with readings from before the failure.
 - A failed fan write is retried after 1 s, doubling up to 30 s, so a hung

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Runner runs external commands; swapped out in tests.
@@ -14,8 +17,13 @@ type Runner interface {
 	Run(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
+// errCutShort marks a run whose output may be incomplete: the command was
+// killed, or something it left behind held stdout past the wait delay.
+// Callers must not use that output, even if it happens to parse.
+var errCutShort = errors.New("output cut short")
+
 // cmdWaitDelay bounds how long a command's output is waited for after it
-// exits or is killed, in case a child it forked still holds the pipes.
+// exits or is killed, in case a child it forked still holds stdout.
 const cmdWaitDelay = time.Second
 
 type execRunner struct {
@@ -25,41 +33,83 @@ type execRunner struct {
 
 // Run runs the command in a process group of its own, so a child it forked
 // can neither hang the read nor outlive it: the group is killed on timeout,
-// and after any failed run (a child holding the pipes past the command's
-// exit shows up as ErrWaitDelay after a clean exit, but as a plain
-// ExitError after a failing one; smartctl fails routinely). A successful
-// run leaves nothing to clean up. (A process stuck in the kernel can still
-// hang Wait; the controller's stuck-read check covers that.)
+// and once the command exits (any child still running is a leftover).
 //
-// The cleanup kill comes after Wait has reaped the command, as os/exec
-// offers no point in between. While any child lives, the group id stays
-// taken, so the kill reaches only our group. With none left it is ESRCH,
-// unless the id was freed and handed to a new group leader in the
-// microseconds since; Linux allocates pids cyclically, so that would take
-// a full pass through pid_max in that time.
+// Both kills happen while the command has exited at most as a zombie, not
+// yet reaped: it is only reaped (cmd.Wait) after them, so the group id
+// is still ours and the kill can't reach anyone else's group. (A process
+// stuck in the kernel can still hang the run; the controller's stuck-read
+// check covers that.)
 //
-// exec.ErrWaitDelay is returned as is: the pipes were closed before EOF,
-// so the output may be incomplete and must not be trusted.
+// stdout is a pipe of our own rather than os/exec's, so a cut-short run is
+// told apart from a plain non-zero exit (which smartctl's exit bitmask
+// makes routine): it returns an error wrapping errCutShort.
 func (r execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	waitDelay := r.waitDelay
+	if waitDelay == 0 {
+		waitDelay = cmdWaitDelay
+	}
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer pr.Close()
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = pw
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		// Wait may already have reaped the command (it does so before it
-		// looks at the context); then its pid no longer names our group.
-		if err := cmd.Process.Signal(syscall.Signal(0)); errors.Is(err, os.ErrProcessDone) {
-			return os.ErrProcessDone
+	err = cmd.Start()
+	pw.Close() // the child has its own copy
+	if err != nil {
+		return nil, err
+	}
+	pgid := cmd.Process.Pid
+
+	var out bytes.Buffer
+	eof := make(chan struct{})
+	go func() { _, _ = out.ReadFrom(pr); close(eof) }()
+	exited := make(chan struct{})
+	go func() { waitExited(pgid); close(exited) }()
+
+	var cut error
+	select {
+	case <-exited:
+	case <-ctx.Done():
+		cut = fmt.Errorf("%w: killed: %w", errCutShort, ctx.Err())
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		<-exited
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL) // leftover children
+	werr := cmd.Wait()
+
+	t := time.NewTimer(waitDelay)
+	defer t.Stop()
+	select {
+	case <-eof:
+	case <-t.C: // a child out of reach (stuck in the kernel) holds stdout
+		pr.Close()
+		<-eof
+		if cut == nil {
+			cut = fmt.Errorf("%w: %w", errCutShort, exec.ErrWaitDelay)
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	cmd.WaitDelay = cmdWaitDelay
-	if r.waitDelay != 0 {
-		cmd.WaitDelay = r.waitDelay
+	if cut != nil {
+		return out.Bytes(), cut
 	}
-	out, err := cmd.Output()
-	if err != nil && cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // leftover children
+	return out.Bytes(), werr
+}
+
+// waitExited blocks until process pid has exited, without reaping it
+// (waitid with WNOWAIT, as os.Process does internally).
+func waitExited(pid int) {
+	var info [128]byte // siginfo_t
+	for {
+		_, _, e := syscall.Syscall6(syscall.SYS_WAITID, 1 /* P_PID */, uintptr(pid),
+			uintptr(unsafe.Pointer(&info)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
+		if e != syscall.EINTR {
+			return
+		}
 	}
-	return out, err
 }

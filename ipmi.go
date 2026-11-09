@@ -22,8 +22,13 @@ type IPMI struct {
 	lockWait time.Duration
 }
 
+// ipmiLockWait is how long a raw command waits for the one before it: as
+// long as that one can legitimately hold the lock (its timeout, plus the
+// wait for its output), so a slow but working call doesn't fail the next.
+const ipmiLockWait = ipmiTimeout + cmdWaitDelay
+
 func newIPMI(run Runner, bin string, dryRun bool) *IPMI {
-	return &IPMI{run: run, bin: bin, dryRun: dryRun, busy: make(chan struct{}, 1), lockWait: ipmiTimeout}
+	return &IPMI{run: run, bin: bin, dryRun: dryRun, busy: make(chan struct{}, 1), lockWait: ipmiLockWait}
 }
 
 func (i *IPMI) raw(ctx context.Context, bytes ...int) error {

@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -206,6 +208,17 @@ func TestDiskSensor(t *testing.T) {
 		t.Fatalf("partial failure: got %+v, %v", r, err)
 	}
 
+	// Output cut short is not trusted, even when it parses.
+	f.out[smartKey("/dev/sdy")] = fmt.Sprintf(smartOK, 90)
+	f.err[smartKey("/dev/sdy")] = fmt.Errorf("%w: %w", errCutShort, exec.ErrWaitDelay)
+	f.out[smartKey("/dev/sdz")] = smartSleep
+	f.err[smartKey("/dev/sdz")] = fmt.Errorf("%w: killed: %w", errCutShort, context.DeadlineExceeded)
+	s.devices = []string{"/dev/sda", "/dev/sdy", "/dev/sdz"}
+	r, err = s.Read(context.Background())
+	if err != nil || r.Partial == nil || r.Temp != 38 || strings.Contains(r.Detail, "asleep") {
+		t.Fatalf("cut-short output: got %+v, %v; want sda only, partial", r, err)
+	}
+
 	// Asleep plus unreadable: no data, and not idle (the unreadable one may be hot).
 	s.devices = []string{"/dev/sdc", "/dev/sdx"}
 	if r, err = s.Read(context.Background()); err == nil || r.Idle {
@@ -245,26 +258,43 @@ func waitGone(t *testing.T, pid string) {
 }
 
 func TestRunnerKillsLingeringChild(t *testing.T) {
-	r := execRunner{timeout: 5 * time.Second, waitDelay: 50 * time.Millisecond}
-	// The command exits at once, leaving a child that holds stdout. Either
-	// way the output may be incomplete, so the read fails (within the wait
-	// delay) rather than being trusted, and the child is killed.
+	r := execRunner{timeout: 5 * time.Second, waitDelay: time.Second}
+	// The command exits at once, leaving a child that holds stdout. The
+	// child is killed as the command exits, so its output is complete and
+	// the exit status is the command's own.
 	for _, c := range []struct {
 		exit    string
 		wantErr func(error) bool
 	}{
-		{"exit 0", func(err error) bool { return errors.Is(err, exec.ErrWaitDelay) }},
+		{"exit 0", func(err error) bool { return err == nil }},
 		{"exit 1", func(err error) bool { var e *exec.ExitError; return errors.As(err, &e) }}, // like smartctl's bitmask
 	} {
 		start := time.Now()
 		out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!; "+c.exit)
-		if !c.wantErr(err) {
+		if !c.wantErr(err) || errors.Is(err, errCutShort) {
 			t.Fatalf("%s: got %v (%T)", c.exit, err, err)
 		}
-		if took := time.Since(start); took > time.Second {
-			t.Fatalf("%s: returned after %s, want about the 50ms wait delay", c.exit, took)
+		if took := time.Since(start); took > 500*time.Millisecond {
+			t.Fatalf("%s: returned after %s, want at once", c.exit, took)
 		}
 		waitGone(t, strings.TrimSpace(string(out)))
+	}
+}
+
+func TestRunnerCutShortOutput(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("no setsid")
+	}
+	r := execRunner{timeout: 5 * time.Second, waitDelay: 50 * time.Millisecond}
+	// A child out of the group's reach holds stdout: the output can't be
+	// known to be complete, even after a non-zero exit.
+	out, err := r.Run(context.Background(), "sh", "-c", "setsid sleep 300 & echo $!; sleep 0.2; exit 1")
+	pid := strings.TrimSpace(string(out))
+	if n, perr := strconv.Atoi(pid); perr == nil {
+		defer syscall.Kill(n, syscall.SIGKILL)
+	}
+	if !errors.Is(err, errCutShort) || !errors.Is(err, exec.ErrWaitDelay) {
+		t.Fatalf("got %v, want a cut-short error", err)
 	}
 }
 
@@ -272,8 +302,8 @@ func TestRunnerKillsGroupOnTimeout(t *testing.T) {
 	r := execRunner{timeout: 100 * time.Millisecond, waitDelay: 50 * time.Millisecond}
 	start := time.Now()
 	out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!; sleep 300")
-	if err == nil {
-		t.Fatal("a command past its timeout succeeded")
+	if !errors.Is(err, errCutShort) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a command past its timeout: got %v, want a cut-short timeout", err)
 	}
 	if took := time.Since(start); took > time.Second {
 		t.Fatalf("timed-out command returned after %s", took)
@@ -443,8 +473,8 @@ func TestIPMILockWaitIsBounded(t *testing.T) {
 		if err := ipmi.SetDuty(context.Background(), 1, 100); err == nil { // zone B: no deadline of its own
 			t.Fatal("write went through while another ipmitool held the lock")
 		}
-		if waited := time.Since(start); waited != ipmiTimeout {
-			t.Fatalf("zone B waited %s for the lock, want %s", waited, ipmiTimeout)
+		if waited := time.Since(start); waited != ipmiLockWait || ipmiLockWait < ipmiTimeout+cmdWaitDelay {
+			t.Fatalf("zone B waited %s for the lock, want %s, as long as a call can hold it", waited, ipmiLockWait)
 		}
 	})
 }
@@ -563,6 +593,25 @@ func TestHysteresis(t *testing.T) {
 		if s.held != c.held {
 			t.Fatalf("read %d: held %.0f, want %.0f", i, s.held, c.held)
 		}
+	}
+}
+
+func TestHotPartialReadingEntersAverage(t *testing.T) {
+	s := newSource(stub("disks"), time.Second, 2)
+	s.avg = window{size: 2}
+	s.apply(ok(40).r, nil)
+	s.apply(ok(40).r, nil)
+	s.apply(partial(55).r, nil) // the missing disk may be hotter still
+	if s.demand != 100 {
+		t.Fatalf("hot partial reading: demand %.1f, want 100", s.demand)
+	}
+	s.apply(ok(41).r, nil) // averaged with the 55 °C, not with the 40s before it
+	if want := Interpolate(testCurve, 48); s.demand != want {
+		t.Fatalf("after a hot partial reading: demand %.1f, want %.1f", s.demand, want)
+	}
+	s.apply(partial(30).r, nil) // a cooler one stays out
+	if s.held != 48 || len(s.avg.vals) != 2 || s.avg.vals[1] != 41 {
+		t.Fatalf("cool partial reading entered the average: held %.1f, window %v", s.held, s.avg.vals)
 	}
 }
 
@@ -1329,6 +1378,83 @@ func TestStuckReadFailsSafeAtItsLimit(t *testing.T) {
 	})
 }
 
+// hangFirst hangs its first read for good, ignoring its context like a
+// disk in D state; later reads answer 40 °C.
+type hangFirst struct {
+	gate  chan struct{}
+	reads atomic.Int32
+}
+
+func (h *hangFirst) Name() string               { return "disks" }
+func (h *hangFirst) maxReadTime() time.Duration { return 100 * time.Millisecond }
+func (h *hangFirst) Read(context.Context) (Reading, error) {
+	if h.reads.Add(1) == 1 {
+		<-h.gate
+	}
+	return Reading{Temp: 40}, nil
+}
+
+func TestStuckReadIsGivenUpOn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		disk := &hangFirst{gate: make(chan struct{})}
+		defer close(disk.gate)
+		f := &fakeRunner{}
+		z := newZone(f, newSource(disk, time.Second, 0))
+		noRamp(z)
+		stop := run(t, z)
+		time.Sleep(200 * time.Millisecond)
+		synctest.Wait()
+		if f.last() != duty(100) {
+			t.Fatalf("not failed safe on a stuck read: %v", f.calls)
+		}
+		time.Sleep(2 * time.Second) // the next poll runs, though the stuck one never returns
+		synctest.Wait()
+		if f.last() != duty(65) || disk.reads.Load() < 2 {
+			t.Fatalf("no recovery while the stuck read hangs: %v after %d reads", f.calls, disk.reads.Load())
+		}
+		stop()
+	})
+}
+
+func TestOnlyOneStuckReadGivenUpOn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		disk := newBlocking(t) // every read hangs
+		disk.budget.Store(int64(100 * time.Millisecond))
+		f := &fakeRunner{}
+		z := newZone(f, newSource(disk, time.Second, 0))
+		noRamp(z)
+		stop := run(t, z)
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if n := disk.reads.Load(); n != 2 {
+			t.Fatalf("%d hung reads piled up, want 2: the one given up on and the next", n)
+		}
+		disk.release() // both land: the stale one frees the slot, the live one recovers
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if f.last() != duty(30) { // the blocking sensor reads 30 °C
+			t.Fatalf("no recovery once the reads land: %v", f.calls)
+		}
+		stop()
+	})
+}
+
+func TestLoopEvaluatesOnlyOnChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := &countSensor{name: "gpu", took: 5 * time.Millisecond}
+		z := newZone(&fakeRunner{}, newSource(c, 10*time.Millisecond, 0))
+		z.tick = time.Hour
+		start := time.Now()
+		stop := run(t, z)
+		time.Sleep(12 * time.Millisecond) // reads land at 5 and 15 ms; one starts at 10
+		stop()
+		if got := z.lastEval.Sub(start); got != 5*time.Millisecond {
+			t.Fatalf("last evaluate at %s, want 5ms: a pass that only starts a read changes nothing", got)
+		}
+		time.Sleep(c.took)
+	})
+}
+
 func TestStuckLimitFollowsDisksFoundDuringRead(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeRunner{}
@@ -1478,6 +1604,7 @@ func TestNextWakeIsAhead(t *testing.T) {
 		if rng.IntN(4) == 0 {
 			s.failsafe("disks=FAILSAFE")
 		}
+		z.lastEval = now.Add(-time.Duration(rng.Int64N(int64(z.tick)))) // the loop evaluates when the tick is due
 		z.checkStuck(now)
 		z.claimDue(now)
 		if w := z.nextWake(now); !w.After(now) {

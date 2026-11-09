@@ -199,8 +199,12 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 
 func (s *diskSensor) readOne(ctx context.Context, dev string) (temp float64, asleep bool, err error) {
 	// smartctl exits non-zero for many harmless reasons (bitmask), so parse
-	// the JSON regardless of the exit status.
+	// the JSON regardless of the exit status, but never output that was cut
+	// short: a fragment can parse as a temperature or a standby message.
 	out, runErr := s.run.Run(ctx, s.bin, "-n", "standby", "-A", "-j", dev)
+	if errors.Is(runErr, errCutShort) {
+		return 0, false, runErr
+	}
 	var j smartJSON
 	if jerr := json.Unmarshal(out, &j); jerr != nil {
 		if runErr != nil {
