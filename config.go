@@ -39,22 +39,37 @@ type Config struct {
 }
 
 type Zone struct {
-	Name     string   `json:"name"`
-	IpmiZone int      `json:"ipmi_zone"` // 0 = CPU/system (FAN1-4), 1 = peripheral (FANA)
+	Name     string `json:"name"`
+	IpmiZone int    `json:"ipmi_zone"` // 0 = CPU/system (FAN1-4), 1 = peripheral (FANA)
+	// Default poll interval for the zone's sources. The zone re-evaluates at
+	// the shortest interval among its sources.
 	Interval Duration `json:"interval"`
 	MinDuty  int      `json:"min_duty"`
 	MaxDuty  int      `json:"max_duty"`
 	// Smallest duty change worth sending; avoids constant small adjustments.
 	MinChange int `json:"min_change"`
-	// Readings averaged per source (moving average) before applying the curve.
-	Smoothing int      `json:"smoothing"`
-	Sources   []Source `json:"sources"`
+	// Readings averaged per source (moving average) before applying the
+	// curve. 1 = no averaging. Useful for spiky sensors such as the CPU.
+	Smoothing int `json:"smoothing"`
+	// Duty used until every source has given a good reading. Default 70.
+	StartupDuty *int `json:"startup_duty,omitempty"`
+	// After demand drops, hold the current duty this long before ramping
+	// down. Default "2m"; "0s" ramps down at once.
+	RampDownDelay *Duration `json:"ramp_down_delay,omitempty"`
+	// Then lower the duty by at most this many percent per minute. Default 10.
+	RampDownRate *float64 `json:"ramp_down_rate,omitempty"`
+	Sources      []Source `json:"sources"`
 }
 
 type Source struct {
 	Type string `json:"type"` // "cpu", "disks" or "gpu"
 	// Curve points as [temp °C, duty %], sorted by temperature.
 	Curve [][2]float64 `json:"curve"`
+	// Poll interval for this source; defaults to the zone's interval.
+	Interval Duration `json:"interval,omitzero"`
+	// A falling temperature is only followed once it has dropped more than
+	// this many °C. 1 stops whole-degree sensors flickering 40↔41.
+	Hysteresis float64 `json:"hysteresis,omitempty"`
 	// cpu: hwmon driver names to read, default ["coretemp", "k10temp"].
 	Hwmon []string `json:"hwmon,omitempty"`
 	// disks: device paths; empty = autodetect /dev/sd* and /dev/nvme*n1.
@@ -65,6 +80,10 @@ type Source struct {
 	// instead of failing safe to max duty.
 	Optional bool `json:"optional,omitempty"`
 }
+
+// minInterval is the shortest poll interval: anything shorter just spawns
+// sensor commands back to back.
+const minInterval = time.Second
 
 var fanModes = map[string]int{"standard": 0, "full": 1, "optimal": 2, "heavyio": 4}
 
@@ -106,10 +125,24 @@ func (c *Config) applyDefaults() {
 			z.MinChange = 2
 		}
 		if z.Smoothing == 0 {
-			z.Smoothing = 3
+			z.Smoothing = 1
+		}
+		if z.StartupDuty == nil {
+			v := min(max(70, z.MinDuty), z.MaxDuty)
+			z.StartupDuty = &v
+		}
+		if z.RampDownDelay == nil {
+			z.RampDownDelay = &Duration{2 * time.Minute}
+		}
+		if z.RampDownRate == nil {
+			v := 10.0
+			z.RampDownRate = &v
 		}
 		for j := range z.Sources {
 			s := &z.Sources[j]
+			if s.Interval.Duration == 0 {
+				s.Interval = z.Interval
+			}
 			if s.FailAfter == 0 {
 				s.FailAfter = 3
 			}
@@ -120,11 +153,16 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// Validate checks a config that has been through applyDefaults (LoadConfig
+// does both); the defaulted pointer fields are assumed set.
 func (c *Config) Validate() error {
 	if c.ExitMode != "" {
 		if _, ok := fanModes[c.ExitMode]; !ok {
 			return fmt.Errorf("exit_mode %q: want standard, full, optimal, heavyio or empty", c.ExitMode)
 		}
+	}
+	if c.Reapply.Duration < minInterval {
+		return fmt.Errorf("reapply must be at least %s", minInterval)
 	}
 	if len(c.Zones) == 0 {
 		return errors.New("no zones configured")
@@ -141,10 +179,31 @@ func (c *Config) Validate() error {
 		if z.MinDuty < 0 || z.MaxDuty > 100 || z.MinDuty > z.MaxDuty {
 			return fmt.Errorf("zone %q: need 0 <= min_duty <= max_duty <= 100", z.Name)
 		}
+		if z.Interval.Duration < minInterval || z.Smoothing < 1 || z.MinChange < 1 {
+			return fmt.Errorf("zone %q: interval must be at least %s, smoothing and min_change at least 1", z.Name, minInterval)
+		}
+		if *z.StartupDuty < z.MinDuty || *z.StartupDuty > z.MaxDuty {
+			return fmt.Errorf("zone %q: startup_duty must be between min_duty and max_duty", z.Name)
+		}
+		if z.RampDownDelay.Duration < 0 {
+			return fmt.Errorf("zone %q: ramp_down_delay must not be negative", z.Name)
+		}
+		if *z.RampDownRate <= 0 {
+			return fmt.Errorf("zone %q: ramp_down_rate must be positive", z.Name)
+		}
 		if len(z.Sources) == 0 {
 			return fmt.Errorf("zone %q: no sources", z.Name)
 		}
 		for _, s := range z.Sources {
+			if s.Interval.Duration < minInterval {
+				return fmt.Errorf("zone %q source %s: interval must be at least %s", z.Name, s.Type, minInterval)
+			}
+			if s.Hysteresis < 0 {
+				return fmt.Errorf("zone %q source %s: hysteresis must not be negative", z.Name, s.Type)
+			}
+			if s.FailAfter < 1 {
+				return fmt.Errorf("zone %q source %s: fail_after must be at least 1", z.Name, s.Type)
+			}
 			switch s.Type {
 			case "cpu", "disks", "gpu":
 			default:

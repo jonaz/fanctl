@@ -34,8 +34,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	run := execRunner{timeout: 20 * time.Second}
-	ipmi := &IPMI{run: run, bin: cfg.Ipmitool, dryRun: *dryRun || *once}
+	run := execRunner{timeout: readTimeout}
+	ipmi := newIPMI(execRunner{timeout: ipmiTimeout}, cfg.Ipmitool, *dryRun || *once)
 
 	zones, err := buildZones(cfg, run, ipmi, exec.LookPath)
 	if err != nil {
@@ -83,7 +83,12 @@ type lookPathFunc func(string) (string, error)
 func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*zoneCtl, error) {
 	var zones []*zoneCtl
 	for _, zc := range cfg.Zones {
-		z := &zoneCtl{cfg: zc, ipmi: ipmi, reapply: cfg.Reapply.Duration, duty: -1}
+		z := &zoneCtl{
+			cfg:     zc,
+			ipmi:    ipmi,
+			reapply: cfg.Reapply.Duration,
+			duty:    -1,
+		}
 		for _, sc := range zc.Sources {
 			var sen Sensor
 			switch sc.Type {
@@ -111,11 +116,17 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 				}
 				sen = &gpuSensor{run: run, bin: cfg.NvidiaSmi}
 			}
-			z.sources = append(z.sources, &source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}})
+			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}})
 		}
 		if len(z.sources) == 0 {
 			return nil, fmt.Errorf("zone %s: no usable sources", zc.Name)
 		}
+		var polls []string
+		for _, s := range z.sources {
+			polls = append(polls, fmt.Sprintf("%s every %s", s.sensor.Name(), s.cfg.Interval.Duration))
+		}
+		log.Printf("zone %s: %s; startup %d%%, ramp down after %s at %g%%/min",
+			zc.Name, strings.Join(polls, ", "), *zc.StartupDuty, zc.RampDownDelay.Duration, *zc.RampDownRate)
 		zones = append(zones, z)
 	}
 	return zones, nil

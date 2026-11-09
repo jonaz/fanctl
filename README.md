@@ -16,12 +16,32 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 
 - At start it sets the BMC fan mode to **Full**, so the BMC stops overriding
   the duty cycles it sets.
-- Each zone runs on its own interval. Every source turns its temperature into a
-  duty through a curve (linear between points). The zone uses the **highest**
-  demand, clamped to `min_duty`…`max_duty`.
-- Readings are smoothed with a moving average (`smoothing` samples).
-  A new duty is sent only when it moves at least `min_change` %, hits min/max,
-  or `reapply` time has passed (in case the BMC resets it).
+- Every source is polled on its own `interval` (the GPU every few seconds, the
+  disks every minute) and turns its temperature into a duty through a curve
+  (linear between points). The zone re-evaluates every second and as soon
+  as any reading arrives, using each source's latest value; it takes the
+  **highest** demand, clamped to `min_duty`…`max_duty`. Each source polls
+  on its own timer in the background, so a slow or hung `smartctl` never
+  delays the GPU or the fan writes, and disks are
+  queried in parallel (up to 8 at once). Fan writes run on their own too
+  (always the latest duty), so a hung BMC never holds up polling; each
+  `ipmitool` call is cut off after 5 s.
+- **Up fast, down slow.** A higher demand is applied at once. When demand
+  drops, the duty is held for `ramp_down_delay` (default 2 min, counted from
+  when the drop is first seen), then lowered
+  by at most `ramp_down_rate` % per minute (default 10) until it reaches the
+  target. Fans react to heat immediately but don't hunt up and down.
+  `startup_duty` is a floor on top of this: it can only raise the fans, and
+  once every source has reported the duty goes straight to what the
+  readings call for. Failsafe instead counts as a real `max_duty` demand, so
+  after a sensor recovers the fans hold and ramp down from 100% and a flaky
+  sensor can't make them hunt.
+- `hysteresis` (°C, per source) ignores small temperature drops, so a disk
+  flickering between 40 and 41 °C doesn't move the fans. `smoothing` (moving
+  average, default 1 = off) helps with spiky sensors such as the CPU.
+- A new duty is sent only when it moves at least `min_change` %, hits min/max,
+  reaches the target at the end of a ramp-down, or `reapply` time has passed
+  (in case the BMC resets it).
 - Disks are read with `smartctl -n standby`, so **sleeping disks are not woken**.
   If all disks sleep, the disk source asks for nothing and `min_duty` applies.
 - On SIGTERM/SIGINT it restores the BMC fan mode (`exit_mode`, default
@@ -29,11 +49,26 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 
 ### Failsafes
 
-- A source that fails to read `fail_after` times in a row (default 3) demands
-  `max_duty` until it recovers. This includes a single disk that stops
-  answering: the fan wall goes to 100% and the log says which disk.
+- Until every source has given a good reading, the zone runs at
+  `startup_duty` (default 70%, kept within `min_duty`…`max_duty`; setting it
+  outside that range is an error).
+- A single failed read keeps the source's last demand. If the disks were all
+  asleep and a read then fails, the zone goes back to `startup_duty`.
+- A partial reading (some disks unreadable) can only raise demand, never
+  lower it or release `startup_duty`: the missing disk may be the hot one.
+- A source that fails to read `fail_after` times in a row (default 3), or
+  whose read runs longer than it legitimately can (25 s, or 20 s per batch of
+  8 disks plus 5 s, checked on time whatever the poll interval), demands `max_duty` until it
+  recovers. This includes a single disk that stops answering: the fan wall
+  goes to 100% and the log says which disk. The first reading after
+  recovery isn't averaged with readings from before the failure.
+- A failed fan write is retried after 1 s, doubling up to 30 s, so a hung
+  BMC isn't hammered. Only a jump to `max_duty` (say, a failsafe) is tried
+  at once.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.
+- On shutdown it waits at most 2 s for running reads, so a hung disk can't
+  stop the BMC fan mode being restored.
 - If fanctl dies, systemd restarts it within 5 s. If it is stopped, the BMC
   gets control back.
 
@@ -87,9 +122,19 @@ temperatures. Starting values:
 | Disks | 34→30, 37→40, 40→60, 43→85, 45→100 | Keep the hottest disk around 40 °C |
 | GPU | 45→30, 60→40, 70→60, 80→100 | The 2060 has its own fans; the wall feeds it fresh air |
 
-Other keys: `devices` (disk list; empty = autodetect non-removable `sd*` and
-`nvme*`), `hwmon` (CPU driver names), `interval`, `smoothing`, `min_change`,
-`fail_after`, `optional`, and tool paths `ipmitool`, `smartctl`, `nvidia_smi`.
+Timing in the example:
+
+| Zone | Polling | Ramp down | Startup |
+| --- | --- | --- | --- |
+| `cpu` | CPU every 2 s, averaged over 3 | after 30 s, 20 %/min | 50% |
+| `fanwall` | GPU every 5 s, disks every 60 s, both 1 °C hysteresis | after 2 min, 5 %/min | 70% |
+
+Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_duty`,
+`min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
+Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
+`devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),
+`hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` (at least 1 s) and tool paths
+`ipmitool`, `smartctl`, `nvidia_smi`.
 
 Tune the disk curve with your temperature graph: if the hottest disk sits above
 42 °C under load, raise the 40 °C and 43 °C points.

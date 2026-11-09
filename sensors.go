@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Reading is one sample from a source.
@@ -66,10 +69,38 @@ func (s *cpuSensor) Read(_ context.Context) (Reading, error) {
 
 // ---- Disks: smartctl, without waking sleeping drives ----
 
+// maxParallelSmartctl caps concurrent smartctl processes on big boxes while
+// still keeping one hung disk from holding up the rest.
+const maxParallelSmartctl = 8
+
 type diskSensor struct {
 	run     Runner
 	bin     string
-	devices []string // empty = autodetect each read
+	devices []string     // empty = autodetect each read
+	count   atomic.Int64 // disks in the latest (or running) Read
+}
+
+// maxReadTime is the longest one Read can legitimately take, plus a
+// margin: one command timeout per batch of maxParallelSmartctl disks.
+// Based on the latest detection, so disks that appear later count.
+func (s *diskSensor) maxReadTime() time.Duration {
+	n := max(int64(len(s.devices)), s.count.Load())
+	return readBudget(max(1, (n+maxParallelSmartctl-1)/maxParallelSmartctl))
+}
+
+// readTimeout bounds each sensor command (smartctl, nvidia-smi).
+const readTimeout = 20 * time.Second
+
+// ipmiTimeout bounds each ipmitool command. A raw command takes well under
+// a second. Writes run in each zone's writer goroutine, but both zones and
+// the exit-mode restore share one IPMI lock, so a hung BMC must give it up
+// sooner than a slow disk read would.
+const ipmiTimeout = 5 * time.Second
+
+// readBudget is how long a read made of n rounds of commands may take:
+// one readTimeout each, plus a margin.
+func readBudget(n int64) time.Duration {
+	return time.Duration(n)*readTimeout + 5*time.Second
 }
 
 func (s *diskSensor) Name() string { return "disks" }
@@ -93,21 +124,49 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 			return Reading{}, errors.New("no disks found")
 		}
 	}
+	s.count.Store(int64(len(devs)))
 	var (
 		best, found = 0.0, false
 		hottest     string
 		asleep      int
 		failed      []string
 	)
-	for _, dev := range devs {
-		t, sleeping, err := s.readOne(ctx, dev)
+	// Up to maxParallelSmartctl workers read the disks, so one hung disk
+	// costs a single smartctl timeout rather than one per disk queued
+	// behind it. Disks beyond the workers wait in line: maxReadTime counts
+	// those batches.
+	type result struct {
+		temp     float64
+		sleeping bool
+		err      error
+	}
+	res := make([]result, len(devs))
+	next := make(chan int)
+	var wg sync.WaitGroup
+	for range min(len(devs), maxParallelSmartctl) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				t, sleeping, err := s.readOne(ctx, devs[i])
+				res[i] = result{t, sleeping, err}
+			}
+		}()
+	}
+	for i := range devs {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+	for i, r := range res {
+		dev := devs[i]
 		switch {
-		case err != nil:
-			failed = append(failed, fmt.Sprintf("%s: %v", dev, err))
-		case sleeping:
+		case r.err != nil:
+			failed = append(failed, fmt.Sprintf("%s: %v", dev, r.err))
+		case r.sleeping:
 			asleep++
-		case !found || t > best:
-			best, found, hottest = t, true, dev
+		case !found || r.temp > best:
+			best, found, hottest = r.temp, true, dev
 		}
 	}
 	var err error
