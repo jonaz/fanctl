@@ -27,9 +27,13 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
 
 type Config struct {
-	Ipmitool  string `json:"ipmitool"`   // path to ipmitool
-	Smartctl  string `json:"smartctl"`   // path to smartctl
-	NvidiaSmi string `json:"nvidia_smi"` // path to nvidia-smi
+	// How to talk to the BMC: "device" (the kernel's /dev/ipmi0, default)
+	// or "ipmitool".
+	IPMI       string `json:"ipmi"`
+	IpmiDevice string `json:"ipmi_device"` // default /dev/ipmi0
+	Ipmitool   string `json:"ipmitool"`    // path to ipmitool
+	Smartctl   string `json:"smartctl"`    // path to smartctl
+	NvidiaSmi  string `json:"nvidia_smi"`  // path to nvidia-smi
 	// Fan mode to restore on exit so the BMC takes over again:
 	// "standard", "full", "optimal", "heavyio" or "" to leave as is.
 	ExitMode string `json:"exit_mode"`
@@ -101,6 +105,12 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.IPMI == "" {
+		c.IPMI = "device"
+	}
+	if c.IpmiDevice == "" {
+		c.IpmiDevice = "/dev/ipmi0"
+	}
 	if c.Ipmitool == "" {
 		c.Ipmitool = "ipmitool"
 	}
@@ -156,6 +166,9 @@ func (c *Config) applyDefaults() {
 // Validate checks a config that has been through applyDefaults (LoadConfig
 // does both); the defaulted pointer fields are assumed set.
 func (c *Config) Validate() error {
+	if c.IPMI != "device" && c.IPMI != "ipmitool" {
+		return fmt.Errorf("ipmi %q: want device or ipmitool", c.IPMI)
+	}
 	if c.ExitMode != "" {
 		if _, ok := fanModes[c.ExitMode]; !ok {
 			return fmt.Errorf("exit_mode %q: want standard, full, optimal, heavyio or empty", c.ExitMode)

@@ -9,8 +9,10 @@ Built for an X11SSM-F in a SilverStone RM420:
 | `cpu` | 0 | FAN1–FAN4 | CPU package temperature (hwmon `coretemp`) |
 | `fanwall` | 1 | FANA | Hottest disk (smartctl), GPU (nvidia-smi) or sustained CPU load, whichever demands more |
 
-No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
-`nvidia-smi`.
+It talks to the BMC directly through the kernel's IPMI device `/dev/ipmi0`, so
+at runtime it only needs `smartctl` (smartmontools) and, for the GPU,
+`nvidia-smi`. `ipmitool` can be used instead (`"ipmi": "ipmitool"`), and is
+handy for the one-off threshold setup below.
 
 ## How it works
 
@@ -26,7 +28,7 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   `smartctl` never delays the GPU or the fan writes, and disks are
   queried in parallel (up to 8 at once). Fan writes run on their own too
   (always the latest duty), so a hung BMC never holds up polling; each
-  `ipmitool` call is cut off after 5 s.
+  BMC command is given up on after 5 s.
 - **Up fast, down slow.** A higher demand is applied at once. When demand
   drops, the duty is held for `ramp_down_delay` (default 2 min, counted from
   when the drop is first seen), then lowered
@@ -82,6 +84,14 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
 
 ## Install
 
+The IPMI device needs the `ipmi_si` and `ipmi_devintf` kernel modules (the
+same ones `ipmitool` uses). Load them now and at every boot:
+
+```bash
+sudo modprobe ipmi_si ipmi_devintf
+printf 'ipmi_si\nipmi_devintf\n' | sudo tee /etc/modules-load.d/ipmi.conf
+```
+
 ```bash
 sudo install -m 755 fanctl /usr/local/bin/fanctl
 sudo install -m 644 fanctl.example.json /etc/fanctl.json
@@ -102,8 +112,10 @@ Check what it sees, without touching the BMC:
 sudo fanctl -config /etc/fanctl.json -once
 ```
 
-`-once` prints each zone's readings and the duty it would set (the `ipmitool`
-commands are logged as `dry-run:`). `-dry-run` runs the full loop the same way.
+`-once` prints each zone's readings and the duty it would set (the BMC
+commands are logged as `dry-run: raw 0x30 0x70 …`, the same bytes for either
+backend, and it warns if `/dev/ipmi0` is missing). `-dry-run` runs the full
+loop the same way.
 
 Then enable it:
 
@@ -149,8 +161,14 @@ Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_
 `min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
 Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
 `devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),
-`hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` (at least 1 s) and tool paths
-`ipmitool`, `smartctl`, `nvidia_smi`.
+`hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` (at least 1 s),
+`ipmi` (`device`, the default, or `ipmitool`), `ipmi_device` (default
+`/dev/ipmi0`) and tool paths `ipmitool`, `smartctl`, `nvidia_smi`.
+
+With `"ipmi": "device"` a BMC error shows its completion code, e.g.
+`/dev/ipmi0 raw 0x30 0x70 0x66 0x01 0x01 0x32: completion code 0xc1 (invalid
+command)`. If the device backend misbehaves, set `"ipmi": "ipmitool"` and
+restart; no rebuild needed.
 
 Tune the disk curve with your temperature graph: if the hottest disk sits above
 42 °C under load, raise the 40 °C and 43 °C points.

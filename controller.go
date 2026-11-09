@@ -285,7 +285,7 @@ func (b *bmcState) failed(duty int, now time.Time) time.Duration {
 type zoneCtl struct {
 	cfg     Zone
 	sources []*source
-	ipmi    *IPMI
+	ipmi    BMC
 	reapply time.Duration
 	tick    time.Duration  // longest the loop sleeps without evaluating; 0 = evalTick
 	wg      sync.WaitGroup // reads and the writer
@@ -301,7 +301,7 @@ type zoneCtl struct {
 	bmc bmcState // owned by the writer
 }
 
-func newZoneCtl(cfg Zone, ipmi *IPMI, reapply time.Duration) *zoneCtl {
+func newZoneCtl(cfg Zone, ipmi BMC, reapply time.Duration) *zoneCtl {
 	return &zoneCtl{cfg: cfg, ipmi: ipmi, reapply: reapply, bmc: bmcState{duty: -1}}
 }
 
