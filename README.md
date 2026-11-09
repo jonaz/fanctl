@@ -175,9 +175,16 @@ sudo modprobe drivetemp
 echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf
 ```
 
-`devices` works as with smartctl; a listed disk with no hwmon counts as a
-failed read. With no disk hwmon at all, fanctl refuses to start (or skips
-the source if it is `optional`). Each read is given up on after 10 s.
+With `devices` empty it reads the same disks smartctl would (non-removable
+`sd*` and `nvme*`). While `drivetemp` is loaded, an autodetected SATA disk
+that it found no sensor on (some older SSDs have none; SAS disks) is left
+out and logged at startup as not monitored, and the zone log says e.g.
+`hottest /dev/sdb, 1 without sensor`. Without `drivetemp` loaded, every
+SATA disk counts as a failed read, so a missing module fails safe instead
+of letting an NVMe decide alone. A disk listed in `devices` must have a
+sensor, or it counts as a failed read. fanctl checks all this at startup
+and refuses to start (or skips the source if it is `optional`) if a read
+could only fail. Each read is given up on after 10 s.
 
 **Spin-down: not yet verified.** Unlike `smartctl -n standby`, the hwmon
 backend has no way to skip a sleeping disk, and it is not yet known whether

@@ -115,21 +115,34 @@ func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zo
 				sen = &cpuSensor{drivers: sc.Hwmon}
 			case "disks":
 				if sc.Backend == "hwmon" {
-					found := scanDiskHwmon()
-					if len(found) == 0 {
-						err := errors.New("no drivetemp/nvme hwmon devices; for SATA disks run modprobe drivetemp " +
-							"(and add drivetemp to /etc/modules-load.d/drivetemp.conf to load it at boot)")
+					// Same rules as each read, so a setup that could only
+					// fail safe is caught here.
+					p := planDisks(sc.Devices)
+					var err error
+					switch {
+					case len(p.failed) > 0:
+						err = errors.New(strings.Join(p.failed, "; "))
+					case len(p.hw) == 0:
+						err = errors.New("no disk with a temperature sensor")
+					}
+					if err != nil && !drivetempLoaded() {
+						err = fmt.Errorf("%w (add drivetemp to /etc/modules-load.d/drivetemp.conf to load it at boot)", err)
+					}
+					if err != nil {
 						if sc.Optional {
-							log.Printf("zone %s: %v, skipping disks", zc.Name, err)
+							log.Printf("zone %s: disks: %v, skipping disks", zc.Name, err)
 							continue
 						}
 						return nil, fmt.Errorf("zone %s: disks: %w", zc.Name, err)
 					}
 					var labels []string
-					for _, h := range found {
+					for _, h := range p.hw {
 						labels = append(labels, h.label())
 					}
-					log.Printf("zone %s: disk hwmon found: %s", zc.Name, strings.Join(labels, " "))
+					log.Printf("zone %s: disk sensors: %s", zc.Name, strings.Join(labels, " "))
+					if len(p.noSensor) > 0 {
+						log.Printf("zone %s: disks without a temperature sensor, not monitored: %s", zc.Name, strings.Join(p.noSensor, " "))
+					}
 					sen = &hwmonDiskSensor{devices: sc.Devices}
 					break
 				}

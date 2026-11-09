@@ -102,37 +102,75 @@ func diskName(dev string) string {
 	return "/dev/" + filepath.Base(dev)
 }
 
-func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
-	all := scanDiskHwmon()
-	if len(all) == 0 {
-		return Reading{}, errors.New("no drivetemp/nvme hwmon devices")
-	}
-	var (
-		hw     []diskHwmon
-		failed []string
-	)
-	if len(s.devices) == 0 {
-		hw = all
-	} else {
-		// Each configured disk must have a hwmon; a hwmon is read once even
-		// if several of its disks (NVMe namespaces) are listed.
-		picked := map[string]bool{}
-		for _, dev := range s.devices {
-			name, found := diskName(dev), false
-			for _, h := range all {
-				if contains(h.disks, name) {
-					found = true
-					if !picked[h.dir] {
-						picked[h.dir] = true
-						hw = append(hw, h)
-					}
-					break
-				}
-			}
-			if !found {
-				failed = append(failed, dev+": no hwmon (modprobe drivetemp?)")
-			}
+func drivetempLoaded() bool {
+	_, err := os.Stat(filepath.Join(sysRoot, "sys/module/drivetemp"))
+	return err == nil
+}
+
+// diskPlan is what one read covers.
+type diskPlan struct {
+	hw       []diskHwmon // to read, each once
+	failed   []string    // disks that should have a sensor but don't
+	noSensor []string    // autodetected SATA disks drivetemp found no sensor on
+}
+
+// planDisks matches the disks to read (devices, or the autodetected
+// non-removable ones) with their hwmon. Without drivetemp loaded no SATA
+// disk has one, so each counts as failed. With it loaded, an autodetected
+// SATA disk without one has no sensor drivetemp can use (some older SSDs,
+// SAS disks) and is left out; a listed one is still an error.
+func planDisks(devices []string) diskPlan {
+	byDisk := map[string]diskHwmon{}
+	for _, h := range scanDiskHwmon() {
+		for _, d := range h.disks {
+			byDisk[d] = h
 		}
+	}
+	loaded := drivetempLoaded()
+	var p diskPlan
+	names := detectDisks()
+	labels := names // for errors: the device as configured
+	if len(devices) > 0 {
+		names, labels = nil, nil
+		for _, dev := range devices {
+			name := diskName(dev)
+			if _, err := os.Stat(filepath.Join(sysRoot, "sys/block", filepath.Base(name))); err != nil {
+				p.failed = append(p.failed, dev+": no such disk")
+				continue
+			}
+			names, labels = append(names, name), append(labels, dev)
+		}
+	}
+	picked := map[string]bool{}
+	for i, name := range names {
+		if h, ok := byDisk[name]; ok {
+			if !picked[h.dir] {
+				picked[h.dir] = true
+				p.hw = append(p.hw, h)
+			}
+			continue
+		}
+		label := labels[i]
+		isSD := strings.HasPrefix(filepath.Base(name), "sd")
+		switch {
+		case isSD && !loaded:
+			p.failed = append(p.failed, label+": drivetemp not loaded (modprobe drivetemp)")
+		case isSD && len(devices) == 0:
+			p.noSensor = append(p.noSensor, name)
+		case isSD:
+			p.failed = append(p.failed, label+": no drivetemp sensor (SAS, no SCT/SMART temperature, or an HBA without ATA passthrough)")
+		default:
+			p.failed = append(p.failed, label+": no nvme hwmon")
+		}
+	}
+	return p
+}
+
+func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
+	plan := planDisks(s.devices)
+	hw, failed := plan.hw, plan.failed
+	if len(hw) == 0 && len(failed) == 0 {
+		return Reading{}, errors.New("no disk with a temperature sensor")
 	}
 
 	type result struct {
@@ -203,7 +241,11 @@ func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
 		}
 		return Reading{}, errors.New("no disk temperatures")
 	}
-	return Reading{Temp: best, Detail: "hottest " + hottest, Partial: partial}, nil
+	detail := "hottest " + hottest
+	if n := len(plan.noSensor); n > 0 {
+		detail += fmt.Sprintf(", %d without sensor", n)
+	}
+	return Reading{Temp: best, Detail: detail, Partial: partial}, nil
 }
 
 func readMilliC(path string) (float64, error) {
