@@ -410,8 +410,12 @@ func TestBuildZonesOptionalGPU(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(zones[1].sources); n != 1 {
-		t.Fatalf("optional gpu should be skipped, got %d sources", n)
+	var names []string
+	for _, s := range zones[1].sources {
+		names = append(names, s.sensor.Name())
+	}
+	if got := strings.Join(names, ","); got != "disks,cpu" {
+		t.Fatalf("optional gpu should be skipped, got sources %s", got)
 	}
 }
 
