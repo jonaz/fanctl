@@ -10,8 +10,8 @@ Built for an X11SSM-F in a SilverStone RM420:
 | `fanwall` | 1 | FANA | Hottest disk (smartctl), GPU (nvidia-smi) or sustained CPU load, whichever demands more |
 
 It talks to the BMC directly through the kernel's IPMI device `/dev/ipmi0`, so
-at runtime it only needs `smartctl` (smartmontools) and, for the GPU,
-`nvidia-smi`. `ipmitool` can be used instead (`"ipmi": "ipmitool"`), and is
+at runtime it only needs `smartctl` (smartmontools, or not even that with
+the `hwmon` disk backend) and, for the GPU, `nvidia-smi`. `ipmitool` can be used instead (`"ipmi": "ipmitool"`), and is
 handy for the one-off threshold setup below.
 
 ## How it works
@@ -47,6 +47,8 @@ handy for the one-off threshold setup below.
   (in case the BMC resets it).
 - Disks are read with `smartctl -n standby`, so **sleeping disks are not woken**.
   If all disks sleep, the disk source asks for nothing and `min_duty` applies.
+- Disks can instead be read from sysfs with `"backend": "hwmon"` on the
+  `disks` source; see [Disk temperatures without smartctl](#disk-temperatures-without-smartctl).
 - On SIGTERM/SIGINT it restores the BMC fan mode (`exit_mode`, default
   `optimal`), so the BMC takes over again.
 
@@ -157,10 +159,36 @@ The zone's 2-minute ramp-down delay keeps a short spike from leaving the wall
 running high for long. A source type can be used in several zones; each zone
 polls it on its own.
 
+### Disk temperatures without smartctl
+
+`"backend": "hwmon"` on the `disks` source reads `temp1_input` from the
+kernel's hwmon devices instead of running `smartctl`, so smartmontools isn't
+needed:
+
+- **NVMe**: built in (Linux 5.5+), one hwmon `nvme` per controller.
+- **SATA**: the `drivetemp` driver (Linux 5.6+), one hwmon per disk. It does
+  not support SAS drives (use `smartctl` for those), and SATA disks behind a
+  SAS HBA only show up if the HBA passes ATA commands through.
+
+```bash
+sudo modprobe drivetemp
+echo drivetemp | sudo tee /etc/modules-load.d/drivetemp.conf
+```
+
+`devices` works as with smartctl; a listed disk with no hwmon counts as a
+failed read. With no disk hwmon at all, fanctl refuses to start (or skips
+the source if it is `optional`). Each read is given up on after 10 s.
+
+**Spin-down: not yet verified.** Unlike `smartctl -n standby`, the hwmon
+backend has no way to skip a sleeping disk, and it is not yet known whether
+reading `drivetemp` wakes one (see issue #2). Until that is tested, keep
+the default `smartctl` backend on systems where disks spin down.
+
 Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_duty`,
 `min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
 Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
 `devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),
+`backend` (disks: `smartctl`, the default, or `hwmon`),
 `hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` (at least 1 s),
 `ipmi` (`device`, the default, or `ipmitool`), `ipmi_device` (default
 `/dev/ipmi0`) and tool paths `ipmitool`, `smartctl`, `nvidia_smi`.

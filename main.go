@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -113,6 +114,25 @@ func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zo
 			case "cpu":
 				sen = &cpuSensor{drivers: sc.Hwmon}
 			case "disks":
+				if sc.Backend == "hwmon" {
+					found := scanDiskHwmon()
+					if len(found) == 0 {
+						err := errors.New("no drivetemp/nvme hwmon devices; for SATA disks run modprobe drivetemp " +
+							"(and add drivetemp to /etc/modules-load.d/drivetemp.conf to load it at boot)")
+						if sc.Optional {
+							log.Printf("zone %s: %v, skipping disks", zc.Name, err)
+							continue
+						}
+						return nil, fmt.Errorf("zone %s: disks: %w", zc.Name, err)
+					}
+					var labels []string
+					for _, h := range found {
+						labels = append(labels, h.label())
+					}
+					log.Printf("zone %s: disk hwmon found: %s", zc.Name, strings.Join(labels, " "))
+					sen = &hwmonDiskSensor{devices: sc.Devices}
+					break
+				}
 				if _, err := lookPath(cfg.Smartctl); err != nil {
 					if sc.Optional {
 						log.Printf("zone %s: smartctl not found, skipping disks", zc.Name)

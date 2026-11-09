@@ -78,6 +78,8 @@ type Source struct {
 	Hwmon []string `json:"hwmon,omitempty"`
 	// disks: device paths; empty = autodetect /dev/sd* and /dev/nvme*n1.
 	Devices []string `json:"devices,omitempty"`
+	// disks: "smartctl" (default) or "hwmon" (drivetemp / nvme in sysfs).
+	Backend string `json:"backend,omitempty"`
 	// After this many failed reads in a row the source demands max duty.
 	FailAfter int `json:"fail_after,omitempty"`
 	// Optional: skip this source if its tool or hardware is missing,
@@ -159,6 +161,9 @@ func (c *Config) applyDefaults() {
 			if s.Type == "cpu" && len(s.Hwmon) == 0 {
 				s.Hwmon = []string{"coretemp", "k10temp"}
 			}
+			if s.Type == "disks" && s.Backend == "" {
+				s.Backend = "smartctl"
+			}
 		}
 	}
 }
@@ -218,7 +223,14 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("zone %q source %s: fail_after must be at least 1", z.Name, s.Type)
 			}
 			switch s.Type {
-			case "cpu", "disks", "gpu":
+			case "cpu", "gpu":
+				if s.Backend != "" {
+					return fmt.Errorf("zone %q source %s: backend is only for disks", z.Name, s.Type)
+				}
+			case "disks":
+				if s.Backend != "smartctl" && s.Backend != "hwmon" {
+					return fmt.Errorf("zone %q source disks: backend %q: want smartctl or hwmon", z.Name, s.Backend)
+				}
 			default:
 				return fmt.Errorf("zone %q: unknown source type %q", z.Name, s.Type)
 			}
