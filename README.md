@@ -20,9 +20,9 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   disks every minute) and turns its temperature into a duty through a curve
   (linear between points). The zone re-evaluates every second and as soon
   as any reading arrives, using each source's latest value; it takes the
-  **highest** demand, clamped to `min_duty`…`max_duty`. Each source polls
-  on its own timer in the background, so a slow or hung `smartctl` never
-  delays the GPU or the fan writes, and disks are
+  **highest** demand, clamped to `min_duty`…`max_duty`. Each read runs in
+  the background, at most one per source at a time, so a slow or hung
+  `smartctl` never delays the GPU or the fan writes, and disks are
   queried in parallel (up to 8 at once). Fan writes run on their own too
   (always the latest duty), so a hung BMC never holds up polling; each
   `ipmitool` call is cut off after 5 s.
@@ -56,6 +56,7 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   asleep and a read then fails, the zone goes back to `startup_duty`.
 - A partial reading (some disks unreadable) can only raise demand, never
   lower it or release `startup_duty`: the missing disk may be the hot one.
+  It counts as a failed read towards `fail_after`.
 - A source that fails to read `fail_after` times in a row (default 3), or
   whose read runs longer than it legitimately can (25 s, or 20 s per batch of
   8 disks plus 5 s, checked on time whatever the poll interval), demands `max_duty` until it
@@ -152,6 +153,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 ## Build
+
+Needs Go 1.25 or later (the tests use `testing/synctest`).
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o fanctl .

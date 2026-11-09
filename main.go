@@ -47,7 +47,7 @@ func main() {
 
 	if *once {
 		for _, z := range zones {
-			z.step(ctx, time.Now())
+			z.step(ctx)
 		}
 		return
 	}
@@ -83,12 +83,7 @@ type lookPathFunc func(string) (string, error)
 func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*zoneCtl, error) {
 	var zones []*zoneCtl
 	for _, zc := range cfg.Zones {
-		z := &zoneCtl{
-			cfg:     zc,
-			ipmi:    ipmi,
-			reapply: cfg.Reapply.Duration,
-			duty:    -1,
-		}
+		z := newZoneCtl(zc, ipmi, cfg.Reapply.Duration)
 		for _, sc := range zc.Sources {
 			var sen Sensor
 			switch sc.Type {

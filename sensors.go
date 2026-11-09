@@ -22,8 +22,13 @@ type Reading struct {
 	Temp   float64
 	Idle   bool
 	Detail string // for logs, e.g. "hottest /dev/sdc"
+	// Partial is set when some parts couldn't be read (e.g. one disk of
+	// several): Temp covers only the rest, so it is a lower bound.
+	Partial error
 }
 
+// Sensor reads a source. As usual in Go, a non-nil error means no data:
+// a reading that covers only some parts comes back with Partial set.
 type Sensor interface {
 	Read(ctx context.Context) (Reading, error)
 	Name() string
@@ -169,26 +174,27 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 			best, found, hottest = r.temp, true, dev
 		}
 	}
-	var err error
+	var partial error
 	if len(failed) > 0 {
-		err = errors.New(strings.Join(failed, "; "))
+		partial = errors.New(strings.Join(failed, "; "))
 	}
 	if !found {
-		if asleep > 0 && len(failed) == 0 {
+		switch {
+		case partial != nil:
+			return Reading{}, partial
+		case asleep > 0:
 			return Reading{Idle: true, Detail: fmt.Sprintf("%d disks asleep", asleep)}, nil
+		default:
+			return Reading{}, errors.New("no disk temperatures")
 		}
-		if err == nil {
-			err = errors.New("no disk temperatures")
-		}
-		return Reading{}, err
 	}
 	detail := "hottest " + hottest
 	if asleep > 0 {
 		detail += fmt.Sprintf(", %d asleep", asleep)
 	}
-	// A partial failure still returns the readings we have, plus the error,
-	// so the controller can count failures and fail safe if they persist.
-	return Reading{Temp: best, Detail: detail}, err
+	// A partial failure still returns the readings we have; the controller
+	// counts it as a failure, so it fails safe if it persists.
+	return Reading{Temp: best, Detail: detail, Partial: partial}, nil
 }
 
 func (s *diskSensor) readOne(ctx context.Context, dev string) (temp float64, asleep bool, err error) {
