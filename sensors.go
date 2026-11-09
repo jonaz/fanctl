@@ -130,26 +130,32 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 		asleep      int
 		failed      []string
 	)
-	// Read all disks at once, so one hung disk costs a single smartctl
-	// timeout rather than one per disk queued behind it.
+	// Up to maxParallelSmartctl workers read the disks, so one hung disk
+	// costs a single smartctl timeout rather than one per disk queued
+	// behind it. Disks beyond the workers wait in line: maxReadTime counts
+	// those batches.
 	type result struct {
 		temp     float64
 		sleeping bool
 		err      error
 	}
 	res := make([]result, len(devs))
+	next := make(chan int)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxParallelSmartctl)
-	for i, dev := range devs {
+	for range min(len(devs), maxParallelSmartctl) {
 		wg.Add(1)
-		go func(i int, dev string) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			t, sleeping, err := s.readOne(ctx, dev)
-			res[i] = result{t, sleeping, err}
-		}(i, dev)
+			for i := range next {
+				t, sleeping, err := s.readOne(ctx, devs[i])
+				res[i] = result{t, sleeping, err}
+			}
+		}()
 	}
+	for i := range devs {
+		next <- i
+	}
+	close(next)
 	wg.Wait()
 	for i, r := range res {
 		dev := devs[i]

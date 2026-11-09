@@ -417,15 +417,17 @@ type blockingSensor struct {
 	started chan struct{}
 	release chan struct{}
 	reads   atomic.Int32
-	budget  time.Duration // max read time; 0 = the default
+	budget  atomic.Int64 // max read time in ns; 0 = the default
+	asked   atomic.Int32 // maxReadTime calls
 }
 
 func (b *blockingSensor) Name() string { return "disks" }
 func (b *blockingSensor) maxReadTime() time.Duration {
-	if b.budget == 0 {
-		return readBudget(1)
+	b.asked.Add(1)
+	if d := time.Duration(b.budget.Load()); d != 0 {
+		return d
 	}
-	return b.budget
+	return readBudget(1)
 }
 func (b *blockingSensor) Read(ctx context.Context) (Reading, error) {
 	if b.reads.Add(1) == 1 {
@@ -568,18 +570,14 @@ func TestFailedSettleWriteIsRetried(t *testing.T) {
 	set37 := "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x25"
 	f.err[set37] = errors.New("bmc busy")
 	ctx, t0 := context.Background(), time.Now()
-	now := t0
-	z.clock = func() time.Time { return now }
 	for i := 0; i <= 30; i++ {
-		now = t0.Add(time.Duration(i) * time.Second)
-		z.step(ctx, now)
+		z.step(ctx, t0.Add(time.Duration(i)*time.Second))
 	}
 	if f.calls[len(f.calls)-1] != set37 || z.duty != 38 {
 		t.Fatalf("expected a failed write of 37%% after 38%%: duty %d, %v", z.duty, f.calls)
 	}
 	delete(f.err, set37)
-	now = t0.Add(31 * time.Second) // a tick later: retry allowed
-	z.step(ctx, now)
+	z.step(ctx, t0.Add(30*time.Second+retryMax)) // past any backoff
 	if z.duty != 37 {
 		t.Fatalf("failed settle write not retried: duty %d, %v", z.duty, f.calls)
 	}
@@ -653,28 +651,6 @@ func TestLoopAppliesPollAsSoonAsItFinishes(t *testing.T) {
 	<-stopped
 }
 
-func TestStuckPollFailsSafe(t *testing.T) {
-	f := &fakeRunner{}
-	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{}), budget: 3 * time.Second}
-	z := newZone(f, newSource(&stubSensor{}, time.Second, 0))
-	z.sources[0].sensor = disk
-	z.async = true
-	ctx, t0 := context.Background(), time.Now()
-	z.clock = func() time.Time { return t0 }
-	z.step(ctx, t0)
-	<-disk.started
-	z.step(ctx, t0.Add(2*time.Second))
-	if lastDuty(f) != duty(70) {
-		t.Fatalf("before fail_after × interval: %v", f.calls)
-	}
-	z.step(ctx, t0.Add(3*time.Second)) // the read budget
-	if lastDuty(f) != duty(100) {
-		t.Fatalf("hung poll should fail safe: %v", f.calls)
-	}
-	close(disk.release)
-	z.wg.Wait()
-}
-
 func TestUnreadableDiskEndsIdle(t *testing.T) {
 	f := &fakeRunner{}
 	st := &stubSensor{name: "disks", seq: []Reading{{Idle: true}, {}}, errs: []error{nil, errors.New("no disk temperatures")}}
@@ -717,28 +693,6 @@ func waitFor(t *testing.T, f *fakeRunner, d string) {
 	t.Fatalf("duty %s never sent: %v", d, f.calls)
 }
 
-func TestStuckLimitAtLeastCommandTimeout(t *testing.T) {
-	f := &fakeRunner{}
-	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
-	z := newZone(f, newSource(&stubSensor{}, time.Second, 0))
-	z.sources[0].sensor = disk
-	z.async, disk.budget = true, 25*time.Second
-	ctx, t0 := context.Background(), time.Now()
-	z.clock = func() time.Time { return t0 }
-	z.step(ctx, t0)
-	<-disk.started
-	z.step(ctx, t0.Add(10*time.Second)) // past fail_after × interval, but a slow read may still return
-	if lastDuty(f) != duty(70) {
-		t.Fatalf("slow read failed safe before the command timeout: %v", f.calls)
-	}
-	z.step(ctx, t0.Add(25*time.Second))
-	if lastDuty(f) != duty(100) {
-		t.Fatalf("should fail safe after stuckMin: %v", f.calls)
-	}
-	close(disk.release)
-	z.wg.Wait()
-}
-
 func TestShutdownDoesNotWaitForHungPoll(t *testing.T) {
 	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
 	z := newZone(&fakeRunner{}, newSource(&stubSensor{}, time.Second, 0))
@@ -746,12 +700,12 @@ func TestShutdownDoesNotWaitForHungPoll(t *testing.T) {
 	z.async = true
 	z.step(context.Background(), time.Now())
 	<-disk.started
-	if z.waitPolls(10 * time.Millisecond) {
-		t.Fatal("waitPolls reported done while a poll hangs")
+	if z.waitWorkers(10 * time.Millisecond) {
+		t.Fatal("waitWorkers reported done while a poll hangs")
 	}
 	close(disk.release)
-	if !z.waitPolls(time.Second) {
-		t.Fatal("waitPolls should return once polls end")
+	if !z.waitWorkers(time.Second) {
+		t.Fatal("waitWorkers should return once polls end")
 	}
 }
 
@@ -909,29 +863,6 @@ func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
 	}
 }
 
-func TestFailedWriteRetriedAtMostEveryHalfTick(t *testing.T) {
-	f := &fakeRunner{err: map[string]error{}}
-	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0))
-	z.tick = 10 * time.Second
-	clock := time.Now()
-	z.clock = func() time.Time { return clock }
-	f.err["ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53"] = errors.New("bmc hung")
-	ctx := context.Background()
-	z.step(ctx, clock)
-	z.evaluate(ctx, clock.Add(time.Second)) // poll completions right after
-	clock = clock.Add(2 * time.Second)
-	z.evaluate(ctx, clock)
-	if len(f.calls) != 1 {
-		t.Fatalf("failed write retried on every evaluate: %v", f.calls)
-	}
-	clock = clock.Add(5 * time.Second) // half a tick after the failure
-	delete(f.err, "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53")
-	z.evaluate(ctx, clock)
-	if len(f.calls) != 2 || z.duty != 83 {
-		t.Fatalf("write not retried after half a tick: duty %d, %v", z.duty, f.calls)
-	}
-}
-
 func TestStartupSnapsFailsafeRamps(t *testing.T) {
 	boom := errors.New("boom")
 	f := &fakeRunner{}
@@ -984,27 +915,10 @@ func TestRecoveryReadingNotAveragedWithOldOnes(t *testing.T) {
 	}
 }
 
-func TestStuckLimitIndependentOfInterval(t *testing.T) {
-	f := &fakeRunner{}
-	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{}), budget: 25 * time.Second}
-	z := newZone(f, newSource(&stubSensor{}, time.Minute, 0)) // fail_after 3 × 60 s = 3 min
-	z.sources[0].sensor = disk
-	z.async = true
-	ctx, t0 := context.Background(), time.Now()
-	z.clock = func() time.Time { return t0 }
-	z.step(ctx, t0)
-	<-disk.started
-	z.step(ctx, t0.Add(25*time.Second))
-	if lastDuty(f) != duty(100) {
-		t.Fatalf("hung read on a 60 s source should fail safe at its 25 s read budget: %v", f.calls)
-	}
-	close(disk.release)
-	z.wg.Wait()
-}
-
 func TestStuckReadFailsSafeBetweenTicks(t *testing.T) {
 	f := &fakeRunner{}
-	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{}), budget: 100 * time.Millisecond}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
+	disk.budget.Store(int64(100 * time.Millisecond))
 	z := newZone(f, newSource(&stubSensor{}, time.Hour, 0)) // next tick in an hour
 	z.sources[0].sensor = disk
 	z.tick = time.Hour
@@ -1020,9 +934,7 @@ func TestStuckReadFailsSafeBetweenTicks(t *testing.T) {
 func TestHigherDutySkipsWriteBackoff(t *testing.T) {
 	f := &fakeRunner{err: map[string]error{}}
 	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45, 50)}, time.Second, 0)) // 83 %, then 100 %
-	z.tick = 10 * time.Second
 	clock := time.Now()
-	z.clock = func() time.Time { return clock }
 	f.err["ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53"] = errors.New("bmc hiccup")
 	ctx := context.Background()
 	z.step(ctx, clock)
@@ -1056,15 +968,178 @@ func TestFailsafeHoldSurvivesRejectedWrites(t *testing.T) {
 	z := newZone(&r.fakeRunner, src)
 	z.ipmi.run = r
 	clock := time.Now()
-	z.clock = func() time.Time { return clock }
 	ctx := context.Background()
 	z.step(ctx, clock) // failsafe: 100 %, write rejected
-	clock = clock.Add(time.Second)
+	clock = clock.Add(retryMin)
 	z.step(ctx, clock) // recovered at 32 °C (37 %): hold 100, write rejected
 	r.fail.Store(false)
-	clock = clock.Add(time.Second)
+	clock = clock.Add(2 * retryMin)
 	z.step(ctx, clock)
 	if lastDuty(&r.fakeRunner) != duty(100) {
 		t.Fatalf("failsafe hold lost while no write had succeeded: %v", r.calls)
 	}
+}
+
+// stateOf reads a source's state under its lock.
+func stateOf(s *source) sourceState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
+// waitState waits until the source reaches st.
+func waitState(t *testing.T, s *source, st sourceState) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if stateOf(s) == st {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("source never reached state %d (now %d)", st, stateOf(s))
+}
+
+func TestStuckReadFailsSafeAtItsLimit(t *testing.T) {
+	f := &fakeRunner{}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
+	disk.budget.Store(int64(200 * time.Millisecond))
+	z := newZone(f, newSource(&stubSensor{}, time.Minute, 0)) // fail_after 3 × 60 s = 3 min
+	s := z.sources[0]
+	s.sensor = disk
+	z.async = true
+	z.step(context.Background(), time.Now())
+	<-disk.started
+	time.Sleep(50 * time.Millisecond)
+	if st := stateOf(s); st != statePending {
+		t.Fatalf("failed safe before the read budget: state %d", st)
+	}
+	waitState(t, s, stateFailsafe)
+	close(disk.release)
+	z.wg.Wait()
+}
+
+func TestStuckLimitFollowsDisksFoundDuringRead(t *testing.T) {
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{})}
+	disk.budget.Store(int64(100 * time.Millisecond))
+	z := newZone(&fakeRunner{}, newSource(&stubSensor{}, time.Minute, 0))
+	s := z.sources[0]
+	s.sensor = disk
+	z.async = true
+	z.step(context.Background(), time.Now())
+	<-disk.started
+	for disk.asked.Load() == 0 { // the watchdog has armed for 100 ms
+		time.Sleep(time.Millisecond)
+	}
+	disk.budget.Store(int64(500 * time.Millisecond)) // autodetect found more disks
+	time.Sleep(250 * time.Millisecond)               // past the old limit
+	if st := stateOf(s); st != statePending {
+		t.Fatalf("failed safe at the old limit: state %d", st)
+	}
+	waitState(t, s, stateFailsafe) // the timer was re-armed for the new one
+	close(disk.release)
+	z.wg.Wait()
+}
+
+func TestStuckLimitDefaultsToReadBudget(t *testing.T) {
+	s := newSource(&stubSensor{name: "gpu"}, time.Second, 0)
+	if got := s.stuckLimit(); got != readBudget(1) || got <= readTimeout {
+		t.Fatalf("stuck limit %s: want one command timeout plus margin", got)
+	}
+}
+
+func TestWriteRetriesBackOff(t *testing.T) {
+	f := &fakeRunner{err: map[string]error{"ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53": errors.New("bmc hung")}}
+	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0)) // 83 %
+	ctx, t0 := context.Background(), time.Now()
+	attempts := func() int { return len(f.calls) }
+	z.step(ctx, t0) // fails: next try after 1 s
+	for _, c := range []struct {
+		at   time.Duration
+		want int
+	}{
+		{500 * time.Millisecond, 1},
+		{1100 * time.Millisecond, 2}, // fails again: 2 s
+		{2500 * time.Millisecond, 2},
+		{3200 * time.Millisecond, 3}, // 4 s
+		{6 * time.Second, 3},
+		{7300 * time.Millisecond, 4},
+	} {
+		z.evaluate(ctx, t0.Add(c.at))
+		if attempts() != c.want {
+			t.Fatalf("at %s: %d attempts, want %d: %v", c.at, attempts(), c.want, f.calls)
+		}
+	}
+	delete(f.err, "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53")
+	z.evaluate(ctx, t0.Add(time.Minute))
+	if z.duty != 83 || z.failures != 0 {
+		t.Fatalf("write not retried after the backoff: duty %d, %v", z.duty, f.calls)
+	}
+}
+
+// hungBMC blocks every ipmitool call until released or cancelled.
+type hungBMC struct {
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (h *hungBMC) Run(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+	h.calls.Add(1)
+	select {
+	case <-h.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestHungBMCDoesNotStallPolling(t *testing.T) {
+	bmc := &hungBMC{release: make(chan struct{})}
+	gpu := &signalSensor{r: Reading{Temp: 45}, done: make(chan struct{}, 100)}
+	z := newZone(&fakeRunner{}, newSource(&stubSensor{}, 10*time.Millisecond, 0))
+	z.sources[0].sensor = gpu
+	z.ipmi.run = bmc
+	z.tick = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { z.loop(ctx); close(stopped) }()
+	for i := 0; i < 10; i++ { // the first write hangs; polls carry on
+		select {
+		case <-gpu.done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("polling stalled behind a hung fan write after %d polls", i)
+		}
+	}
+	if n := bmc.calls.Load(); n != 1 {
+		t.Fatalf("%d ipmitool calls, want the one hung write", n)
+	}
+	cancel()
+	select {
+	case <-stopped: // the writer's call is cancelled, so shutdown is prompt
+	case <-time.After(time.Second):
+		t.Fatal("loop did not stop")
+	}
+}
+
+func TestWriterReappliesOnItsOwn(t *testing.T) {
+	f := &fakeRunner{}
+	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Hour, 0))
+	z.tick, z.reapply = time.Hour, 20*time.Millisecond // no evaluate after the first
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { z.loop(ctx); close(stopped) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		n := len(f.calls)
+		f.mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("duty not reapplied without an evaluate: %d writes", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-stopped
 }

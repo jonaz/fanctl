@@ -23,8 +23,9 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   latest value; it takes the **highest** demand, clamped to
   `min_duty`…`max_duty`. Sources are read in the background, so a slow or
   hung `smartctl` never delays the GPU or the fan writes, and disks are
-  queried in parallel (up to 8 at once). Fan writes themselves run inline,
-  so each `ipmitool` call is cut off after 5 s.
+  queried in parallel (up to 8 at once). Fan writes run on their own too
+  (always the latest duty), so a hung BMC never holds up polling; each
+  `ipmitool` call is cut off after 5 s.
 - **Up fast, down slow.** A higher demand is applied at once. When demand
   drops, the duty is held for `ramp_down_delay` (default 2 min, counted from
   when the drop is first seen), then lowered
@@ -61,9 +62,8 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   recovers. This includes a single disk that stops answering: the fan wall
   goes to 100% and the log says which disk. The first reading after
   recovery isn't averaged with readings from before the failure.
-- A failed fan write is retried at most every half tick, so a hung BMC
-  doesn't block the zone on every reading. A higher duty (say, a failsafe)
-  is tried at once.
+- A failed fan write is retried after 1 s, doubling up to 30 s, so a hung
+  BMC isn't hammered. A higher duty (say, a failsafe) is tried at once.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.
 - On shutdown it waits at most 2 s for running reads, so a hung disk can't
