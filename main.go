@@ -137,7 +137,9 @@ func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zo
 					}
 					var labels []string
 					for _, h := range p.hw {
-						labels = append(labels, h.label())
+						if l := h.label(); !contains(labels, l) { // multipath: one disk, several hwmons
+							labels = append(labels, l)
+						}
 					}
 					log.Printf("zone %s: disk sensors: %s", zc.Name, strings.Join(labels, " "))
 					if len(p.noSensor) > 0 {

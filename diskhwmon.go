@@ -39,10 +39,12 @@ func (h diskHwmon) label() string {
 }
 
 type hwmonDiskSensor struct {
-	devices []string // empty = every disk hwmon
+	devices []string // empty = autodetect
+	// read reads one temp1_input; nil = readMilliC. Tests make it block.
+	read func(path string) (float64, error)
 
 	mu   sync.Mutex
-	busy map[string]bool // hwmon dirs with a read still running
+	busy map[string]time.Time // hwmon dirs with a read running, since when
 }
 
 func (s *hwmonDiskSensor) Name() string { return "disks" }
@@ -57,15 +59,11 @@ var (
 // scanDiskHwmon lists the disk hwmon devices and the block devices each
 // one covers.
 func scanDiskHwmon() []diskHwmon {
-	dirs, _ := filepath.Glob(filepath.Join(sysRoot, "sys/class/hwmon/hwmon*"))
 	var out []diskHwmon
-	for _, d := range dirs {
-		name, err := os.ReadFile(filepath.Join(d, "name"))
-		if err != nil {
-			continue
-		}
+	for _, hd := range hwmonDirs(diskHwmonDrivers) {
+		d := hd.dir
 		var disks []string
-		switch strings.TrimSpace(string(name)) {
+		switch hd.name {
 		case "drivetemp":
 			// hwmonN/device is the SCSI device H:C:T:L; its block/ holds sdX.
 			entries, _ := os.ReadDir(filepath.Join(d, "device", "block"))
@@ -84,8 +82,6 @@ func scanDiskHwmon() []diskHwmon {
 					disks = append(disks, "/dev/"+m[1]+m[2])
 				}
 			}
-		default:
-			continue
 		}
 		sort.Strings(disks)
 		out = append(out, diskHwmon{dir: d, disks: disks})
@@ -120,10 +116,12 @@ type diskPlan struct {
 // SATA disk without one has no sensor drivetemp can use (some older SSDs,
 // SAS disks) and is left out; a listed one is still an error.
 func planDisks(devices []string) diskPlan {
-	byDisk := map[string]diskHwmon{}
+	// With NVMe multipath several controllers (hwmons) share one disk:
+	// all of them are read, so the hottest counts.
+	byDisk := map[string][]diskHwmon{}
 	for _, h := range scanDiskHwmon() {
 		for _, d := range h.disks {
-			byDisk[d] = h
+			byDisk[d] = append(byDisk[d], h)
 		}
 	}
 	loaded := drivetempLoaded()
@@ -143,10 +141,12 @@ func planDisks(devices []string) diskPlan {
 	}
 	picked := map[string]bool{}
 	for i, name := range names {
-		if h, ok := byDisk[name]; ok {
-			if !picked[h.dir] {
-				picked[h.dir] = true
-				p.hw = append(p.hw, h)
+		if hs := byDisk[name]; len(hs) > 0 {
+			for _, h := range hs {
+				if !picked[h.dir] {
+					picked[h.dir] = true
+					p.hw = append(p.hw, h)
+				}
 			}
 			continue
 		}
@@ -177,24 +177,31 @@ func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
 		temp float64
 		err  error
 	}
+	read := s.read
+	if read == nil {
+		read = readMilliC
+	}
 	res := make([]chan result, len(hw))
 	for i, h := range hw {
 		res[i] = make(chan result, 1)
 		s.mu.Lock()
 		if s.busy == nil {
-			s.busy = map[string]bool{}
+			s.busy = map[string]time.Time{}
 		}
-		hung := s.busy[h.dir]
-		s.busy[h.dir] = true
+		since, hung := s.busy[h.dir]
+		if !hung {
+			s.busy[h.dir] = time.Now()
+		}
 		s.mu.Unlock()
 		if hung {
 			// A sysfs read can't be cancelled. Don't pile up goroutines
 			// behind one that never returns.
-			res[i] <- result{err: errors.New("previous read still hung")}
+			res[i] <- result{err: fmt.Errorf("read hung since %s (%s ago); the disk isn't answering",
+				since.Format("15:04:05"), time.Since(since).Round(time.Second))}
 			continue
 		}
 		go func() {
-			t, err := readMilliC(filepath.Join(h.dir, "temp1_input"))
+			t, err := read(filepath.Join(h.dir, "temp1_input"))
 			s.mu.Lock()
 			delete(s.busy, h.dir)
 			s.mu.Unlock()
@@ -248,6 +255,22 @@ func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
 	return Reading{Temp: best, Detail: detail, Partial: partial}, nil
 }
 
+type hwmonDir struct{ dir, name string }
+
+// hwmonDirs lists the hwmon devices whose driver name is in names.
+func hwmonDirs(names []string) []hwmonDir {
+	dirs, _ := filepath.Glob(filepath.Join(sysRoot, "sys/class/hwmon/hwmon*"))
+	var out []hwmonDir
+	for _, d := range dirs {
+		b, err := os.ReadFile(filepath.Join(d, "name"))
+		if name := strings.TrimSpace(string(b)); err == nil && contains(names, name) {
+			out = append(out, hwmonDir{d, name})
+		}
+	}
+	return out
+}
+
+// readMilliC reads a hwmon temperature file (millidegrees) in °C.
 func readMilliC(path string) (float64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

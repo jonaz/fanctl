@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
 // fakeDiskSysfs builds a sysfs tree with:
@@ -17,6 +20,7 @@ import (
 //	hwmon3 nvme → nvme0n1      38 °C
 //	hwmon4 nvme (multipath) → nvme1c1n1, i.e. /dev/nvme1n1, 36 °C
 //	hwmon5 drivetemp → sdd     60 °C, removable (USB), not autodetected
+//	hwmon6 nvme (multipath) → nvme1c2n1: a second path to /dev/nvme1n1, 40 °C
 //	sdc: a SATA SSD drivetemp found no sensor on
 //
 // with drivetemp loaded.
@@ -53,6 +57,7 @@ func fakeDiskSysfs(t *testing.T) string {
 	mkdir(d + "/device/ng0n1") // char device node, not a namespace
 	mkdir(hw("hwmon4", "nvme", "36000") + "/device/nvme1c1n1")
 	mkdir(hw("hwmon5", "drivetemp", "60000") + "/device/block/sdd")
+	mkdir(hw("hwmon6", "nvme", "40000") + "/device/nvme1c2n1")
 	for _, b := range []string{"sda", "sdb", "sdc", "sdd", "nvme0n1", "nvme1n1"} {
 		write("sys/block/"+b+"/removable", "0\n")
 	}
@@ -67,7 +72,7 @@ func TestScanDiskHwmon(t *testing.T) {
 	for _, h := range scanDiskHwmon() {
 		got = append(got, filepath.Base(h.dir)+"="+h.label())
 	}
-	want := "hwmon1=/dev/sda hwmon2=/dev/sdb hwmon3=/dev/nvme0n1 hwmon4=/dev/nvme1n1 hwmon5=/dev/sdd"
+	want := "hwmon1=/dev/sda hwmon2=/dev/sdb hwmon3=/dev/nvme0n1 hwmon4=/dev/nvme1n1 hwmon5=/dev/sdd hwmon6=/dev/nvme1n1"
 	if strings.Join(got, " ") != want {
 		t.Fatalf("got %v, want %s", got, want)
 	}
@@ -109,6 +114,58 @@ func TestHwmonDiskSensorMissingDevice(t *testing.T) {
 	}
 }
 
+// Both controllers of a multipath namespace are read: the hotter counts.
+func TestHwmonDiskSensorMultipath(t *testing.T) {
+	fakeDiskSysfs(t)
+	r, err := (&hwmonDiskSensor{devices: []string{"/dev/nvme1n1"}}).Read(context.Background())
+	if err != nil || r.Temp != 40 || r.Partial != nil {
+		t.Fatalf("got %+v, %v; want 40 from the second controller", r, err)
+	}
+}
+
+// A sysfs read that never returns is given up on after hwmonReadTimeout,
+// and while it hangs the disk is not read again (no goroutine pile-up).
+// Once it returns, the disk is read normally.
+func TestHwmonDiskSensorHungRead(t *testing.T) {
+	fakeDiskSysfs(t)
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		var hungReads atomic.Int32
+		s := &hwmonDiskSensor{read: func(path string) (float64, error) {
+			if strings.Contains(path, "/hwmon2/") { // sdb, the hottest
+				hungReads.Add(1)
+				<-release
+			}
+			return readMilliC(path)
+		}}
+		start := time.Now()
+		r, err := s.Read(context.Background())
+		if err != nil || r.Temp != 41 || r.Partial == nil || !strings.Contains(r.Partial.Error(), "/dev/sdb: read timed out") {
+			t.Fatalf("got %+v, %v; want 41 with /dev/sdb timed out", r, err)
+		}
+		if d := time.Since(start); d != hwmonReadTimeout {
+			t.Fatalf("read took %s, want %s", d, hwmonReadTimeout)
+		}
+		time.Sleep(time.Minute)
+		r, err = s.Read(context.Background())
+		if err != nil || r.Partial == nil || !strings.Contains(r.Partial.Error(), "/dev/sdb: read hung since") ||
+			!strings.Contains(r.Partial.Error(), "1m10s ago") {
+			t.Fatalf("got %+v, %v; want /dev/sdb hung for 1m10s", r, err)
+		}
+		if time.Since(start) != hwmonReadTimeout+time.Minute {
+			t.Fatal("a read with a known hung disk waited for it")
+		}
+		if n := hungReads.Load(); n != 1 {
+			t.Fatalf("hung disk read %d times, want once", n)
+		}
+		close(release)
+		synctest.Wait()
+		if r, err := s.Read(context.Background()); err != nil || r.Temp != 45 || r.Partial != nil {
+			t.Fatalf("after recovery: got %+v, %v; want 45", r, err)
+		}
+	})
+}
+
 // Without drivetemp no SATA disk has a sensor: each one is a failed read,
 // not a disk without a sensor, or the NVMe would quietly decide alone.
 func TestHwmonDiskSensorDrivetempNotLoaded(t *testing.T) {
@@ -117,8 +174,8 @@ func TestHwmonDiskSensorDrivetempNotLoaded(t *testing.T) {
 		os.RemoveAll(filepath.Join(root, p))
 	}
 	r, err := (&hwmonDiskSensor{}).Read(context.Background())
-	if err != nil || r.Temp != 38 || r.Partial == nil || strings.Count(r.Partial.Error(), "drivetemp not loaded") != 3 {
-		t.Fatalf("got %+v, %v; want 38 from nvme with sda, sdb, sdc failed", r, err)
+	if err != nil || r.Temp != 40 || r.Partial == nil || strings.Count(r.Partial.Error(), "drivetemp not loaded") != 3 {
+		t.Fatalf("got %+v, %v; want 40 from nvme with sda, sdb, sdc failed", r, err)
 	}
 }
 

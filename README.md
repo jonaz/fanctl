@@ -184,7 +184,10 @@ SATA disk counts as a failed read, so a missing module fails safe instead
 of letting an NVMe decide alone. A disk listed in `devices` must have a
 sensor, or it counts as a failed read. fanctl checks all this at startup
 and refuses to start (or skips the source if it is `optional`) if a read
-could only fail. Each read is given up on after 10 s.
+could only fail. Each read is given up on after 10 s. A sysfs read can't be
+cancelled, so a disk whose read still hangs is not read again until it
+answers; until then it counts as a failed read, logged as `read hung since
+<time>`. With NVMe multipath, every controller's sensor is read.
 
 **Spin-down: not yet verified.** Unlike `smartctl -n standby`, the hwmon
 backend has no way to skip a sleeping disk, and it is not yet known whether
