@@ -103,9 +103,9 @@ const readTimeout = 20 * time.Second
 const ipmiTimeout = 5 * time.Second
 
 // readBudget is how long a read made of n rounds of commands may take:
-// one readTimeout each, plus a margin.
+// one readTimeout each plus its output wait (cmdWaitDelay), plus a margin.
 func readBudget(n int64) time.Duration {
-	return time.Duration(n)*readTimeout + 5*time.Second
+	return time.Duration(n)*(readTimeout+cmdWaitDelay) + 5*time.Second
 }
 
 func (s *diskSensor) Name() string { return "disks" }

@@ -45,10 +45,11 @@ type source struct {
 	frag     string // last reading, for logs
 
 	// Poll scheduling, also loop-owned.
+	// A read is stuck once it is in flight past stuckAt; that is derived,
+	// never stored, so it can't drift out of step with these.
 	next      time.Time // when the next poll is due; zero = at once
 	inFlight  bool
 	startedAt time.Time
-	stuck     bool // the in-flight read has outlived stuckLimit
 }
 
 // apply folds one read into the source's state. Pure apart from logging:
@@ -430,47 +431,55 @@ func (z *zoneCtl) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		// However the loop woke (a tick or a result can race the cancel),
+		// a pass never starts at shutdown: no more reads or writes.
+		if ctx.Err() != nil {
+			return
+		}
 		now := time.Now()
 		z.checkStuck(now)
 		z.evaluate(ctx, now) // the first pass puts the startup duty on at once
-		z.startDue(ctx, now, results)
-		// Never a zero wait: a deadline that somehow stayed in the past
-		// must not turn the loop into a busy spin.
+		for _, s := range z.claimDue(now) {
+			z.wg.Add(1)
+			go func() {
+				defer z.wg.Done()
+				r, err := s.sensor.Read(ctx)
+				select {
+				case results <- pollResult{s, r, err}:
+				case <-ctx.Done():
+				}
+			}()
+		}
+		// nextWake is always after now here (TestNextWakeIsAhead); the
+		// floor only keeps a future bug from becoming a busy spin.
 		timer.Reset(max(z.nextWake(now).Sub(now), minWait))
 		select {
 		case <-ctx.Done():
-			return
 		case res := <-results:
 			res.s.inFlight = false
-			if ctx.Err() != nil {
-				return // a cancelled read is not a sensor failure
+			if ctx.Err() == nil { // a cancelled read is not a sensor failure
+				res.s.apply(res.r, res.err)
 			}
-			res.s.apply(res.r, res.err)
 		case <-timer.C:
 		}
 	}
 }
 
-// startDue starts a read for each source that is due and not already
-// being read. Polls keep their interval's cadence; one that overran its
-// slot runs again as soon as it lands.
-func (z *zoneCtl) startDue(ctx context.Context, now time.Time, results chan<- pollResult) {
+// claimDue marks each source that is due and not already being read as in
+// flight from now, advances its schedule, and returns them for the loop to
+// read. Polls keep their interval's cadence; one that overran its slot
+// runs again as soon as it lands.
+func (z *zoneCtl) claimDue(now time.Time) []*source {
+	var due []*source
 	for _, s := range z.sources {
 		if s.inFlight || now.Before(s.next) {
 			continue
 		}
-		s.inFlight, s.startedAt, s.stuck = true, now, false
+		s.inFlight, s.startedAt = true, now
 		s.next = nextSlot(s.next, now, s.cfg.Interval.Duration)
-		z.wg.Add(1)
-		go func() {
-			defer z.wg.Done()
-			r, err := s.sensor.Read(ctx)
-			select {
-			case results <- pollResult{s, r, err}:
-			case <-ctx.Done():
-			}
-		}()
+		due = append(due, s)
 	}
+	return due
 }
 
 // nextSlot is the poll slot after the one due at prev (zero = first poll,
@@ -492,22 +501,19 @@ func nextSlot(prev, now time.Time, interval time.Duration) time.Time {
 // the read extend it.
 func (z *zoneCtl) checkStuck(now time.Time) {
 	for _, s := range z.sources {
-		if !s.inFlight || s.stuck {
+		// Already failed safe (by this read or by fail_after): a source in
+		// flight can't leave failsafe, as only a landed read does that.
+		if !s.inFlight || now.Before(s.stuckAt()) || s.state == stateFailsafe {
 			continue
 		}
-		if !now.Before(s.stuckAt()) {
-			s.stuck = true
-			running := now.Sub(s.startedAt)
-			if s.state != stateFailsafe {
-				s.failsafe(s.sensor.Name() + "=STUCK")
-				log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), running.Round(time.Second))
-			}
-		}
+		s.failsafe(s.sensor.Name() + "=STUCK")
+		log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), now.Sub(s.startedAt).Round(time.Second))
 	}
 }
 
 // nextWake is when the loop must next look: the next poll due, the next
 // read that could turn stuck, or the evaluate tick, whichever is first.
+// A read already past its stuck deadline has nothing more to wake for.
 func (z *zoneCtl) nextWake(now time.Time) time.Time {
 	tick := z.tick
 	if tick == 0 {
@@ -515,14 +521,11 @@ func (z *zoneCtl) nextWake(now time.Time) time.Time {
 	}
 	wake := now.Add(tick)
 	for _, s := range z.sources {
-		var at time.Time
-		switch {
-		case !s.inFlight:
-			at = s.next
-		case !s.stuck:
-			at = s.stuckAt()
-		default:
-			continue
+		at := s.next
+		if s.inFlight {
+			if at = s.stuckAt(); !at.After(now) {
+				continue
+			}
 		}
 		if at.Before(wake) {
 			wake = at

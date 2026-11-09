@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -221,6 +222,50 @@ func TestGPUSensor(t *testing.T) {
 	}
 }
 
+// gone reports whether pid has exited (and been reaped, or is a zombie).
+func gone(pid string) bool {
+	b, err := os.ReadFile("/proc/" + pid + "/stat")
+	if err != nil {
+		return true
+	}
+	f := strings.Fields(string(b))
+	return len(f) > 2 && f[2] == "Z"
+}
+
+// waitGone waits up to a second for pid to exit.
+func waitGone(t *testing.T, pid string) {
+	t.Helper()
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if gone(pid) {
+			return
+		}
+	}
+	t.Fatalf("child %s outlived its command", pid)
+}
+
+func TestRunnerKillsLingeringChild(t *testing.T) {
+	r := execRunner{timeout: 5 * time.Second, waitDelay: 50 * time.Millisecond}
+	// The command exits 0 at once, leaving a child that holds stdout.
+	out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!")
+	if err != nil {
+		t.Fatalf("a lingering child made a successful command fail: %v", err)
+	}
+	waitGone(t, strings.TrimSpace(string(out)))
+}
+
+func TestRunnerKillsGroupOnTimeout(t *testing.T) {
+	r := execRunner{timeout: 100 * time.Millisecond, waitDelay: 50 * time.Millisecond}
+	start := time.Now()
+	out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!; sleep 300")
+	if err == nil {
+		t.Fatal("a command past its timeout succeeded")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("timed-out command returned after %s", took)
+	}
+	waitGone(t, strings.TrimSpace(string(out)))
+}
+
 // barrierRunner only answers once n calls are running at the same time.
 type barrierRunner struct {
 	n       int
@@ -260,7 +305,7 @@ func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
 	for i := range devs {
 		devs[i] = fmt.Sprintf("/dev/sd%c", 'a'+i)
 	}
-	if got, want := (&diskSensor{devices: devs}).maxReadTime(), 2*readTimeout+5*time.Second; got != want {
+	if got, want := (&diskSensor{devices: devs}).maxReadTime(), readBudget(2); got != want {
 		t.Fatalf("12 disks: %s, want %s", got, want)
 	}
 
@@ -275,7 +320,7 @@ func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
 	}
 	s := &diskSensor{run: f, bin: "smartctl"}
 	s.Read(context.Background())
-	if got, want := s.maxReadTime(), readTimeout+5*time.Second; got != want {
+	if got, want := s.maxReadTime(), readBudget(1); got != want {
 		t.Fatalf("4 disks: %s, want %s", got, want)
 	}
 	for _, d := range devs[4:] { // hotplugged after start
@@ -283,8 +328,17 @@ func TestStuckLimitCoversSmartctlBatches(t *testing.T) {
 		f.out[smartKey(d)] = fmt.Sprintf(smartOK, 35)
 	}
 	s.Read(context.Background())
-	if got, want := s.maxReadTime(), 2*readTimeout+5*time.Second; got != want {
+	if got, want := s.maxReadTime(), readBudget(2); got != want {
 		t.Fatalf("12 disks after hotplug: %s, want %s", got, want)
+	}
+}
+
+func TestReadBudgetCoversWorstCase(t *testing.T) {
+	// Every batch may run to its timeout and then wait out its pipes.
+	for n := int64(1); n <= 20; n++ {
+		if worst := time.Duration(n) * (readTimeout + cmdWaitDelay); readBudget(n) <= worst {
+			t.Fatalf("%d batches: budget %s, worst case %s", n, readBudget(n), worst)
+		}
 	}
 }
 
@@ -1055,6 +1109,31 @@ func TestBackoffStartsWhenTheCallEnds(t *testing.T) {
 
 // ---- the loop: real goroutines on the virtual clock ----
 
+// captureLog sends the log to a buffer for the rest of the test.
+func captureLog(t *testing.T) *syncBuffer {
+	b := &syncBuffer{}
+	log.SetOutput(b)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return b
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
 // countSensor counts reads; safe for concurrent use.
 type countSensor struct {
 	name string
@@ -1207,6 +1286,7 @@ func TestLoopAppliesPollAsSoonAsItFinishes(t *testing.T) {
 }
 
 func TestStuckReadFailsSafeAtItsLimit(t *testing.T) {
+	logs := captureLog(t)
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeRunner{}
 		disk := newBlocking(t)
@@ -1223,6 +1303,11 @@ func TestStuckReadFailsSafeAtItsLimit(t *testing.T) {
 		synctest.Wait()
 		if f.last() != duty(100) || z.sources[0].frag != "disks=STUCK" {
 			t.Fatalf("stuck read not failed safe at its budget: %v", f.calls)
+		}
+		time.Sleep(3 * time.Hour) // three more ticks, still stuck: logged once
+		synctest.Wait()
+		if n := strings.Count(logs.String(), "failing safe"); n != 1 {
+			t.Fatalf("stuck read logged %d times, want once:\n%s", n, logs.String())
 		}
 		disk.release()
 		stop()
@@ -1340,6 +1425,51 @@ func TestLoopRampsBetweenPolls(t *testing.T) {
 		}
 		stop()
 	})
+}
+
+func TestNoPassAfterShutdown(t *testing.T) {
+	// A wakeup (tick or result) can race the cancel; whichever select
+	// picks, the next pass must not run. A loop entered cancelled shows it.
+	synctest.Test(t, func(t *testing.T) {
+		f, c := &fakeRunner{}, &countSensor{name: "gpu"}
+		z := newZone(f, newSource(c, time.Second, 0))
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		z.loop(ctx)
+		if c.n.Load() != 0 || f.n() != 0 {
+			t.Fatalf("pass ran after cancel: %d reads, writes %v", c.n.Load(), f.calls)
+		}
+	})
+}
+
+// TestNextWakeIsAhead: after a loop pass (checkStuck, claimDue) the next
+// wakeup is always in the future, whatever state the sources are in, so
+// the loop can never spin.
+func TestNextWakeIsAhead(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 7))
+	now := time.Now()
+	for i := range 10000 {
+		disk := &blockingSensor{}
+		disk.budget.Store(int64(time.Duration(1+rng.IntN(60)) * time.Second))
+		s := newSource(disk, time.Duration(1+rng.IntN(60))*time.Second, 0)
+		z := newZone(&fakeRunner{}, s)
+		z.tick = time.Duration(1+rng.IntN(5000)) * time.Millisecond
+		if rng.IntN(2) == 0 {
+			s.next = now.Add(time.Duration(rng.IntN(120)-60) * time.Second)
+		}
+		if rng.IntN(2) == 0 {
+			s.inFlight, s.startedAt = true, now.Add(-time.Duration(rng.IntN(120))*time.Second)
+		}
+		if rng.IntN(4) == 0 {
+			s.failsafe("disks=FAILSAFE")
+		}
+		z.checkStuck(now)
+		z.claimDue(now)
+		if w := z.nextWake(now); !w.After(now) {
+			t.Fatalf("case %d: next wake %s is not after now (in flight %v, started %s, next %s)",
+				i, w.Sub(now), s.inFlight, s.startedAt.Sub(now), s.next.Sub(now))
+		}
+	}
 }
 
 // ---- randomized invariants ----
