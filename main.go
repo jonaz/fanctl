@@ -35,7 +35,11 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	run := execRunner{timeout: readTimeout}
-	ipmi := newIPMI(execRunner{timeout: ipmiTimeout}, cfg.Ipmitool, *dryRun || *once)
+	ipmi, closeBMC, err := newBMC(cfg, *dryRun || *once)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer closeBMC()
 
 	zones, err := buildZones(cfg, run, ipmi, exec.LookPath)
 	if err != nil {
@@ -78,9 +82,28 @@ func main() {
 	}
 }
 
+// newBMC sets up the configured IPMI backend. A dry run never talks to the
+// BMC, so it doesn't open the device either, but warns if it is missing.
+func newBMC(cfg *Config, dryRun bool) (*IPMI, func(), error) {
+	switch {
+	case cfg.IPMI == "ipmitool":
+		return newIPMI(ipmitool{run: execRunner{timeout: ipmiTimeout}, bin: cfg.Ipmitool}, dryRun), func() {}, nil
+	case dryRun:
+		if _, err := os.Stat(cfg.IpmiDevice); err != nil {
+			log.Printf("warning: %v; a real run would fail (modprobe -a ipmi_si ipmi_devintf, or set \"ipmi\": \"ipmitool\")", err)
+		}
+		return newIPMI(nil, true), func() {}, nil
+	}
+	d, err := openIPMIDevice(cfg.IpmiDevice)
+	if err != nil {
+		return nil, nil, err
+	}
+	return newIPMI(d, false), func() { d.Close() }, nil
+}
+
 type lookPathFunc func(string) (string, error)
 
-func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*zoneCtl, error) {
+func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zoneCtl, error) {
 	var zones []*zoneCtl
 	for _, zc := range cfg.Zones {
 		z := newZoneCtl(zc, ipmi, cfg.Reapply.Duration)

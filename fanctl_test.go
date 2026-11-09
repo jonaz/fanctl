@@ -406,7 +406,7 @@ func TestBuildZonesOptionalGPU(t *testing.T) {
 		}
 		return "/usr/bin/" + bin, nil
 	}
-	zones, err := buildZones(c, &fakeRunner{}, newIPMI(nil, "", false), look)
+	zones, err := buildZones(c, &fakeRunner{}, newIPMI(nil, false), look)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,11 +423,55 @@ func TestBuildZonesOptionalGPU(t *testing.T) {
 
 func TestSetModeCommand(t *testing.T) {
 	f := &fakeRunner{}
-	if err := (newIPMI(f, "ipmitool", false)).SetMode(context.Background(), fanModes["full"]); err != nil {
+	if err := (newIPMI(ipmitool{run: f, bin: "ipmitool"}, false)).SetMode(context.Background(), fanModes["full"]); err != nil {
 		t.Fatal(err)
 	}
 	if f.calls[0] != "ipmitool raw 0x30 0x45 0x01 0x01" {
 		t.Fatalf("got %q", f.calls[0])
+	}
+}
+
+// A dry run logs the same raw bytes whichever backend, and sends nothing.
+func TestDryRunLogsRawBytes(t *testing.T) {
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	f := &fakeRunner{}
+	for _, cfg := range []Config{{IPMI: "ipmitool", Ipmitool: "ipmitool"}, {IPMI: "device", IpmiDevice: t.TempDir() + "/ipmi0"}} {
+		buf.Reset()
+		ipmi, closeBMC, err := newBMC(&cfg, true)
+		if err != nil {
+			t.Fatalf("%s: %v", cfg.IPMI, err)
+		}
+		if cfg.IPMI == "ipmitool" {
+			ipmi.t = ipmitool{run: f, bin: "ipmitool"}
+		}
+		if err := ipmi.SetDuty(context.Background(), 1, 83); err != nil {
+			t.Fatal(err)
+		}
+		closeBMC()
+		if !strings.Contains(buf.String(), "dry-run: raw 0x30 0x70 0x66 0x01 0x01 0x53\n") {
+			t.Errorf("%s: logged %q", cfg.IPMI, buf.String())
+		}
+	}
+	if f.n() != 0 {
+		t.Fatalf("dry run ran %v", f.calls)
+	}
+	if !strings.Contains(buf.String(), "warning:") {
+		t.Errorf("dry run with no device didn't warn: %q", buf.String())
+	}
+}
+
+func TestIPMIConfig(t *testing.T) {
+	ok := [][2]float64{{1, 1}, {2, 2}}
+	c := Config{Zones: []Zone{{Name: "a", Sources: []Source{{Type: "cpu", Curve: ok}}}}}
+	c.applyDefaults()
+	if err := c.Validate(); err != nil || c.IPMI != "device" || c.IpmiDevice != "/dev/ipmi0" {
+		t.Fatalf("defaults: ipmi %q, ipmi_device %q, err %v", c.IPMI, c.IpmiDevice, err)
+	}
+	c.IPMI = "freeipmi"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "want device or ipmitool") {
+		t.Fatalf("ipmi freeipmi: got %v", err)
 	}
 }
 
@@ -451,7 +495,7 @@ func TestIPMIWaitForLockHonoursContext(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		bmc := &hungBMC{release: make(chan struct{})}
 		defer close(bmc.release)
-		ipmi := newIPMI(bmc, "ipmitool", false)
+		ipmi := newIPMI(ipmitool{run: bmc, bin: "ipmitool"}, false)
 		go ipmi.SetDuty(context.Background(), 1, 50) // stuck in the kernel, holding the lock
 		synctest.Wait()
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -470,7 +514,7 @@ func TestIPMILockWaitIsBounded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		bmc := &hungBMC{release: make(chan struct{})}
 		defer close(bmc.release)
-		ipmi := newIPMI(bmc, "ipmitool", false)
+		ipmi := newIPMI(ipmitool{run: bmc, bin: "ipmitool"}, false)
 		go ipmi.SetDuty(context.Background(), 0, 50) // zone A: stuck in the kernel
 		synctest.Wait()
 		start := time.Now()
@@ -527,7 +571,7 @@ func newSource(sen Sensor, interval time.Duration, hyst float64) *source {
 func newZone(f Runner, srcs ...*source) *zoneCtl {
 	z := newZoneCtl(Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2,
 		StartupDuty: ptr(70), RampDownDelay: &Duration{2 * time.Minute}, RampDownRate: ptr(10.0)},
-		newIPMI(f, "ipmitool", false), 5*time.Minute)
+		newIPMI(ipmitool{run: f, bin: "ipmitool"}, false), 5*time.Minute)
 	z.tick = time.Second
 	for _, s := range srcs {
 		z.addSource(s)
