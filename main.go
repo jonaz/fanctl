@@ -84,13 +84,10 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 	var zones []*zoneCtl
 	for _, zc := range cfg.Zones {
 		z := &zoneCtl{
-			cfg:       zc,
-			ipmi:      ipmi,
-			reapply:   cfg.Reapply.Duration,
-			startup:   *zc.StartupDuty,
-			rampDelay: zc.RampDownDelay.Duration,
-			rampRate:  *zc.RampDownRate,
-			duty:      -1,
+			cfg:     zc,
+			ipmi:    ipmi,
+			reapply: cfg.Reapply.Duration,
+			duty:    -1,
 		}
 		for _, sc := range zc.Sources {
 			var sen Sensor
@@ -132,7 +129,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 			polls = append(polls, fmt.Sprintf("%s every %s", s.sensor.Name(), s.cfg.Interval.Duration))
 		}
 		log.Printf("zone %s: %s; startup %d%%, ramp down after %s at %g%%/min",
-			zc.Name, strings.Join(polls, ", "), z.startup, z.rampDelay, z.rampRate)
+			zc.Name, strings.Join(polls, ", "), *zc.StartupDuty, zc.RampDownDelay.Duration, *zc.RampDownRate)
 		zones = append(zones, z)
 	}
 	return zones, nil

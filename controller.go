@@ -123,6 +123,9 @@ func (s *source) apply(r Reading, err error) {
 		s.failsafe(name + "=FAILSAFE")
 		return
 	}
+	if err != nil && s.state == stateFailsafe {
+		return // still failed safe (e.g. a stuck read returning an error): keep the reason
+	}
 	// A failed read with no usable data keeps the previous state (or the
 	// startup duty if there is none yet); fail_after above bounds how long.
 	if err != nil && r.Temp == 0 && !r.Idle {
@@ -214,8 +217,8 @@ func (s *source) schedule(now time.Time) {
 		s.next = now
 	}
 	iv := s.cfg.Interval.Duration
-	for s.next = s.next.Add(iv); !s.next.After(now); {
-		s.next = s.next.Add(iv)
+	if s.next = s.next.Add(iv); !s.next.After(now) {
+		s.next = s.next.Add((now.Sub(s.next)/iv + 1) * iv) // first slot after now
 	}
 }
 
@@ -238,10 +241,6 @@ type zoneCtl struct {
 	clock   func() time.Time // nil = time.Now; tests set a fake
 	wg      sync.WaitGroup   // background polls and the writer
 	done    chan struct{}    // a background poll finished; nil = nobody listens
-
-	startup   int
-	rampDelay time.Duration
-	rampRate  float64 // % per minute
 
 	// The ramp, owned by evaluate.
 	level    float64   // internal duty; ramps down smoothly between whole percents
@@ -271,6 +270,7 @@ type order struct {
 
 func (z *zoneCtl) addSource(s *source) {
 	s.peak = -1
+	s.frag = s.sensor.Name() + "=pending" // until the first poll
 	z.sources = append(z.sources, s)
 }
 
@@ -338,7 +338,7 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 		case stateFailsafe:
 			d = float64(z.cfg.MaxDuty)
 		case statePending:
-			floor = math.Max(floor, float64(z.startup))
+			floor = math.Max(floor, float64(*z.cfg.StartupDuty))
 		}
 		readWant = math.Max(readWant, d)
 		parts = append(parts, frag)
@@ -356,14 +356,15 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 		if z.dropAt.IsZero() {
 			z.dropAt = now
 		}
-		if now.Sub(z.dropAt) < z.rampDelay {
+		delay, rate := z.cfg.RampDownDelay.Duration, *z.cfg.RampDownRate
+		if now.Sub(z.dropAt) < delay {
 			break // hold: demand only just dropped
 		}
-		from := z.dropAt.Add(z.rampDelay)
+		from := z.dropAt.Add(delay)
 		if z.lastStep.After(from) {
 			from = z.lastStep
 		}
-		z.level = math.Max(realTarget, z.level-z.rampRate*now.Sub(from).Minutes())
+		z.level = math.Max(realTarget, z.level-rate*now.Sub(from).Minutes())
 	}
 	z.lastStep = now
 

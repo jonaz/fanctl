@@ -204,14 +204,12 @@ func newSource(st *stubSensor, interval time.Duration, hyst float64) *source {
 
 func newZone(f *fakeRunner, srcs ...*source) *zoneCtl {
 	z := &zoneCtl{
-		cfg:       Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2},
-		ipmi:      &IPMI{run: f, bin: "ipmitool"},
-		reapply:   5 * time.Minute,
-		tick:      time.Second,
-		startup:   70,
-		rampDelay: 2 * time.Minute,
-		rampRate:  10,
-		duty:      -1,
+		cfg: Zone{Name: "fanwall", IpmiZone: 1, MinDuty: 30, MaxDuty: 100, MinChange: 2,
+			StartupDuty: ptr(70), RampDownDelay: &Duration{2 * time.Minute}, RampDownRate: ptr(10.0)},
+		ipmi:    &IPMI{run: f, bin: "ipmitool"},
+		reapply: 5 * time.Minute,
+		tick:    time.Second,
+		duty:    -1,
 	}
 	for _, s := range srcs {
 		z.addSource(s)
@@ -339,7 +337,7 @@ func TestStartupAndFailsafe(t *testing.T) {
 		seq:  []Reading{{}, {}, {}, {Temp: 30}},
 		errs: []error{boom, boom, boom, nil}}
 	z := newZone(f, newSource(st, time.Second, 0))
-	z.rampDelay, z.rampRate = 0, 1e6 // isolate from ramping
+	z.cfg.RampDownDelay, z.cfg.RampDownRate = &Duration{0}, ptr(1e6) // isolate from ramping
 	ctx, t0 := context.Background(), time.Now()
 	z.step(ctx, t0)
 	if lastDuty(f) != duty(70) {
@@ -363,7 +361,7 @@ func TestTransientErrorKeepsLastDemand(t *testing.T) {
 	f := &fakeRunner{}
 	st := &stubSensor{name: "gpu", seq: []Reading{{Temp: 45}, {}}, errs: []error{nil, errors.New("timeout")}}
 	z := newZone(f, newSource(st, time.Second, 0))
-	z.rampDelay = 0
+	z.cfg.RampDownDelay = &Duration{}
 	t0 := time.Now()
 	z.step(context.Background(), t0)
 	z.step(context.Background(), t0.Add(time.Minute))
@@ -514,7 +512,7 @@ func TestPartialReadingOnlyRaisesDemand(t *testing.T) {
 		f := &fakeRunner{}
 		st := &stubSensor{name: "disks", seq: temps(45, 31, 31), errs: []error{nil, partial, nil}}
 		z := newZone(f, newSource(st, time.Second, 0))
-		z.rampDelay, z.rampRate = 0, 1e6
+		z.cfg.RampDownDelay, z.cfg.RampDownRate = &Duration{0}, ptr(1e6)
 		ctx, t0 := context.Background(), time.Now()
 		for i := 0; i < 2; i++ {
 			z.step(ctx, t0.Add(time.Duration(i)*time.Second))
@@ -547,7 +545,7 @@ func TestIntervalNotRoundedToTick(t *testing.T) {
 func TestHoldStartsAtFirstDrop(t *testing.T) {
 	f := &fakeRunner{}
 	z := newZone(f, newSource(&stubSensor{name: "disks", seq: temps(50, 30)}, time.Minute, 0))
-	z.tick, z.rampDelay = time.Minute, 30*time.Second
+	z.tick, z.cfg.RampDownDelay = time.Minute, &Duration{30 * time.Second}
 	ctx, t0 := context.Background(), time.Now()
 	z.step(ctx, t0) // 100 %
 	z.step(ctx, t0.Add(time.Minute))
@@ -566,7 +564,7 @@ func TestFailedSettleWriteIsRetried(t *testing.T) {
 	// 40.3 °C → 66 %, then 32 °C → 37 %. Ramping 1 %/s with min_change 2
 	// sends 66, 64 … 38, and the final 1 % step to 37 via the settle rule.
 	z := newZone(f, newSource(&stubSensor{name: "disks", seq: temps(40.3, 32)}, time.Second, 0))
-	z.rampDelay, z.rampRate = 0, 60
+	z.cfg.RampDownDelay, z.cfg.RampDownRate = &Duration{0}, ptr(60.0)
 	set37 := "ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x25"
 	f.err[set37] = errors.New("bmc busy")
 	ctx, t0 := context.Background(), time.Now()
@@ -749,7 +747,7 @@ func TestUnseenFailsafeIsNotTreatedAsReading(t *testing.T) {
 func TestTimeNeverRunsBackwards(t *testing.T) {
 	f := &fakeRunner{}
 	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(50, 30)}, time.Second, 0))
-	z.rampDelay, z.rampRate = 0, 60
+	z.cfg.RampDownDelay, z.cfg.RampDownRate = &Duration{0}, ptr(60.0)
 	ctx, t0 := context.Background(), time.Now()
 	z.step(ctx, t0)
 	z.step(ctx, t0.Add(time.Second))
@@ -1142,4 +1140,37 @@ func TestWriterReappliesOnItsOwn(t *testing.T) {
 	}
 	cancel()
 	<-stopped
+}
+
+func TestFailsafeReasonSurvivesErrors(t *testing.T) {
+	st := &stubSensor{name: "disks", seq: []Reading{{}}, errs: []error{errors.New("timeout")}}
+	z := newZone(&fakeRunner{}, newSource(st, time.Second, 0))
+	s := z.sources[0]
+	s.inFlight.Store(true)
+	s.markStuck(time.Minute)
+	s.poll(context.Background()) // the stuck read finally fails
+	if _, st, frag := s.want(); st != stateFailsafe || frag != "disks=STUCK" {
+		t.Fatalf("state %d, log %q: want failsafe with the STUCK reason", st, frag)
+	}
+}
+
+func TestUnpolledSourceLogsPending(t *testing.T) {
+	z := newZone(&fakeRunner{}, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0))
+	if _, _, frag := z.sources[0].want(); frag != "gpu=pending" {
+		t.Fatalf("log for an unpolled source %q, want gpu=pending", frag)
+	}
+}
+
+func TestScheduleAfterLongStall(t *testing.T) {
+	s := newSource(&stubSensor{}, time.Second, 0)
+	t0 := time.Now()
+	s.next = t0
+	s.schedule(t0.Add(24*time.Hour + 300*time.Millisecond)) // a read hung for a day
+	if want := t0.Add(24*time.Hour + time.Second); !s.next.Equal(want) {
+		t.Fatalf("next poll %s after t0, want %s", s.next.Sub(t0), want.Sub(t0))
+	}
+	s.schedule(s.next) // exactly on the slot: the next one
+	if want := t0.Add(24*time.Hour + 2*time.Second); !s.next.Equal(want) {
+		t.Fatalf("next poll %s after t0, want %s", s.next.Sub(t0), want.Sub(t0))
+	}
 }
