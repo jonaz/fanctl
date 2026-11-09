@@ -153,6 +153,8 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// Validate checks a config that has been through applyDefaults (LoadConfig
+// does both); the defaulted pointer fields are assumed set.
 func (c *Config) Validate() error {
 	if c.ExitMode != "" {
 		if _, ok := fanModes[c.ExitMode]; !ok {
