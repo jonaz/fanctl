@@ -81,6 +81,10 @@ type Source struct {
 	Optional bool `json:"optional,omitempty"`
 }
 
+// minInterval is the shortest poll interval: anything shorter just spawns
+// sensor commands back to back.
+const minInterval = time.Second
+
 var fanModes = map[string]int{"standard": 0, "full": 1, "optimal": 2, "heavyio": 4}
 
 func LoadConfig(path string) (*Config, error) {
@@ -170,24 +174,27 @@ func (c *Config) Validate() error {
 		if z.MinDuty < 0 || z.MaxDuty > 100 || z.MinDuty > z.MaxDuty {
 			return fmt.Errorf("zone %q: need 0 <= min_duty <= max_duty <= 100", z.Name)
 		}
-		if z.Interval.Duration < 0 || z.Smoothing < 1 || z.MinChange < 1 {
-			return fmt.Errorf("zone %q: interval must be positive, smoothing and min_change at least 1", z.Name)
+		if z.Interval.Duration < minInterval || z.Smoothing < 1 || z.MinChange < 1 {
+			return fmt.Errorf("zone %q: interval must be at least %s, smoothing and min_change at least 1", z.Name, minInterval)
 		}
-		if z.StartupDuty != nil && (*z.StartupDuty < z.MinDuty || *z.StartupDuty > z.MaxDuty) {
+		if *z.StartupDuty < z.MinDuty || *z.StartupDuty > z.MaxDuty {
 			return fmt.Errorf("zone %q: startup_duty must be between min_duty and max_duty", z.Name)
 		}
-		if z.RampDownDelay != nil && z.RampDownDelay.Duration < 0 {
+		if z.RampDownDelay.Duration < 0 {
 			return fmt.Errorf("zone %q: ramp_down_delay must not be negative", z.Name)
 		}
-		if z.RampDownRate != nil && *z.RampDownRate <= 0 {
+		if *z.RampDownRate <= 0 {
 			return fmt.Errorf("zone %q: ramp_down_rate must be positive", z.Name)
 		}
 		if len(z.Sources) == 0 {
 			return fmt.Errorf("zone %q: no sources", z.Name)
 		}
 		for _, s := range z.Sources {
-			if s.Interval.Duration < 0 || s.Hysteresis < 0 {
-				return fmt.Errorf("zone %q source %s: interval and hysteresis must not be negative", z.Name, s.Type)
+			if s.Interval.Duration < minInterval {
+				return fmt.Errorf("zone %q source %s: interval must be at least %s", z.Name, s.Type, minInterval)
+			}
+			if s.Hysteresis < 0 {
+				return fmt.Errorf("zone %q source %s: hysteresis must not be negative", z.Name, s.Type)
 			}
 			if s.FailAfter < 1 {
 				return fmt.Errorf("zone %q source %s: fail_after must be at least 1", z.Name, s.Type)

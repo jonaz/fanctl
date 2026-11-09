@@ -88,8 +88,13 @@ func (s *diskSensor) maxReadTime() time.Duration {
 	return readBudget(max(1, (n+maxParallelSmartctl-1)/maxParallelSmartctl))
 }
 
-// readTimeout bounds each external command (smartctl, nvidia-smi, ipmitool).
+// readTimeout bounds each sensor command (smartctl, nvidia-smi).
 const readTimeout = 20 * time.Second
+
+// ipmiTimeout bounds each ipmitool command. A raw command takes well under
+// a second; a hung BMC must not stall the zone loops (which write inline
+// and share one IPMI lock) for as long as a slow disk may take.
+const ipmiTimeout = 5 * time.Second
 
 // readBudget is how long a read made of n rounds of commands may take:
 // one readTimeout each, plus a margin.

@@ -24,10 +24,8 @@ const (
 // Each source is polled on its own interval; between polls the zone
 // keeps using its last demand.
 type source struct {
-	cfg     Source
-	sensor  Sensor
-	maxDuty int // the zone's limits, for want()
-	startup int
+	cfg    Source
+	sensor Sensor
 
 	next     time.Time   // when to poll next; zero = poll now (zone loop only)
 	started  time.Time   // when the running async poll began (zone loop only)
@@ -59,11 +57,11 @@ func (s *source) poll(ctx context.Context) {
 	s.apply(r, err)
 	// Latch the demand until the zone has seen it, so a quick follow-up
 	// poll can't replace a hot reading before it reaches the fans. Only
-	// real demand: startup/failsafe floors are already in the state.
-	// An unseen failsafe isn't latched: the zone only holds max_duty for
-	// failsafes it actually acted on.
-	if real, _ := s.current(); s.state != stateFailsafe && real > s.peak {
-		s.peak = real
+	// readings: the state itself carries the startup floor. An unseen
+	// failsafe isn't latched: the zone only holds max_duty for failsafes
+	// it actually acted on.
+	if d := s.current(); s.state != stateFailsafe && d > s.peak {
+		s.peak = d
 	}
 }
 
@@ -152,37 +150,32 @@ func (s *source) apply(r Reading, err error) {
 	}
 }
 
-// want returns what this source asks for: real is the demand from
-// readings (raised by any poll the zone hasn't seen yet), floor is the
-// startup/failsafe minimum on top of it.
-func (s *source) want() (real, floor float64, frag string) {
+// want returns what this source asks for: its state, and the demand from
+// readings (raised by any poll the zone hasn't seen yet). The zone turns
+// failsafe into max_duty and pending into the startup floor.
+func (s *source) want() (demand float64, st sourceState, frag string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	real, floor = s.current()
-	real = math.Max(real, s.peak)
+	demand = math.Max(s.current(), s.peak)
 	s.peak = -1
-	return real, floor, s.frag
+	return demand, s.state, s.frag
 }
 
-// readBudget is the longest one read of this source can legitimately take.
-func (s *source) readBudget() time.Duration {
+// stuckLimit is the longest one read of this source can legitimately take.
+func (s *source) stuckLimit() time.Duration {
 	if b, ok := s.sensor.(interface{ maxReadTime() time.Duration }); ok {
 		return b.maxReadTime() // e.g. disks: batches of smartctl
 	}
 	return readBudget(1)
 }
 
-func (s *source) current() (real, floor float64) {
-	switch s.state {
-	case stateOK:
-		return s.demand, 0
-	case stateIdle:
-		return 0, 0
-	case stateFailsafe:
-		return float64(s.maxDuty), 0
-	default: // pending: partial readings may already ask for more
-		return s.demand, float64(s.startup)
+// current is the demand from readings: none while idle or failed safe;
+// while pending, partial readings may already ask for something.
+func (s *source) current() float64 {
+	if s.state == stateIdle || s.state == stateFailsafe {
+		return 0
 	}
+	return s.demand
 }
 
 // due reports whether the source should be polled at now. Half a tick of
@@ -223,15 +216,38 @@ type zoneCtl struct {
 	dropAt   time.Time // when demand first fell below level; zero = not ramping
 	lastStep time.Time
 	lastSent time.Time
-	// writeFailed is when SetDuty last failed; zero = last write worked.
-	// Retries wait half a tick, so a hung BMC isn't hit (and the loop
-	// blocked) on every poll completion.
+	// writeFailed is when SetDuty last failed (zero = last write worked),
+	// failedDuty what it tried to send. Retries of that duty or lower wait
+	// half a tick, so a hung BMC isn't hit (and the loop blocked) on every
+	// poll completion; a higher duty is tried at once.
 	writeFailed time.Time
+	failedDuty  int
 }
 
 func (z *zoneCtl) addSource(s *source) {
-	s.maxDuty, s.startup, s.peak = z.cfg.MaxDuty, z.startup, -1
+	s.peak = -1
 	z.sources = append(z.sources, s)
+}
+
+// wake makes loop evaluate again soon; never blocks.
+func (z *zoneCtl) wake() {
+	if z.done != nil {
+		select {
+		case z.done <- struct{}{}:
+		default: // a wakeup is already pending
+		}
+	}
+}
+
+// checkStuck fails safe every source whose poll has run past its limit:
+// failures are only counted when a read returns, and a hung one never does.
+// Independent of the interval, so slow sources fail safe just as fast.
+func (z *zoneCtl) checkStuck(now time.Time) {
+	for _, s := range z.sources {
+		if s.inFlight.Load() && now.Sub(s.started) >= s.stuckLimit() {
+			s.markStuck(now.Sub(s.started))
+		}
+	}
 }
 
 // step polls the sources that are due and updates the fans.
@@ -251,14 +267,7 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 		z.evaluate(ctx, now)
 		return
 	}
-	for _, s := range z.sources {
-		// A read running longer than it can legitimately take is hung;
-		// independent of interval, so slow sources fail safe just as fast.
-		limit := s.readBudget()
-		if s.inFlight.Load() && now.Sub(s.started) >= limit {
-			s.markStuck(now.Sub(s.started))
-		}
-	}
+	z.checkStuck(now)
 	z.evaluate(ctx, now)
 	launched := z.now() // after evaluate: a slow fan write isn't read time
 	for _, s := range z.sources {
@@ -266,16 +275,16 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 			continue // not due, or the previous poll is still running
 		}
 		s.started = launched
+		// Wake the loop when the read would count as stuck, so a source
+		// polled every minute still fails safe at its read budget, not at
+		// the next tick.
+		stuck := time.AfterFunc(s.stuckLimit(), z.wake)
 		z.wg.Add(1)
 		go func(s *source) {
 			defer z.wg.Done()
 			s.poll(ctx) // clears inFlight
-			if z.done != nil {
-				select {
-				case z.done <- struct{}{}:
-				default: // a wakeup is already pending
-				}
-			}
+			stuck.Stop()
+			z.wake()
 		}(s)
 		s.schedule(now)
 	}
@@ -283,11 +292,12 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 
 // evaluate moves the fans toward the highest demand.
 //
-// z.level follows real readings only: up at once, down only after
-// ramp_down_delay and then at most ramp_down_rate % per minute. Startup and
-// failsafe demand is a floor on top of it, never part of the ramp, so
-// entering either can only raise the fans and leaving either continues
-// from wherever the real readings' ramp has got to.
+// z.level follows real demand: up at once, down only after ramp_down_delay
+// and then at most ramp_down_rate % per minute. A failsafe source counts as
+// real max_duty demand, so the fans hold and ramp down after it recovers.
+// The startup duty of a pending source is a floor on top of the level,
+// never part of the ramp: entering startup can only raise the fans, and
+// leaving it goes straight to wherever the real demand's ramp has got to.
 func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	if now.Before(z.lastStep) {
 		now = z.lastStep // never let the ramp see time run backwards
@@ -295,15 +305,23 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	readWant, floor := float64(z.cfg.MinDuty), 0.0
 	parts := make([]string, 0, len(z.sources))
 	for _, s := range z.sources {
-		real, fl, frag := s.want()
-		readWant, floor = math.Max(readWant, real), math.Max(floor, fl)
+		d, st, frag := s.want()
+		switch st {
+		case stateFailsafe:
+			d = float64(z.cfg.MaxDuty)
+		case statePending:
+			floor = math.Max(floor, float64(z.startup))
+		}
+		readWant = math.Max(readWant, d)
 		parts = append(parts, frag)
 	}
 	realTarget := float64(clampRound(readWant, z.cfg.MinDuty, z.cfg.MaxDuty))
 	target := float64(clampRound(math.Max(readWant, floor), z.cfg.MinDuty, z.cfg.MaxDuty))
 
 	switch {
-	case z.duty < 0 || realTarget >= z.level:
+	case z.lastStep.IsZero() || realTarget >= z.level:
+		// First evaluate (keyed on that, not on a successful write, so a
+		// BMC rejecting writes can't erase a failsafe's hold), or a rise.
 		z.level = realTarget
 		z.dropAt = time.Time{}
 	default:
@@ -336,12 +354,14 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 			// the last duty actually sent, so a failed write is retried
 			(z.duty > duty && float64(duty) == target))) ||
 		now.Sub(z.lastSent) >= z.reapply
-	if !send || (!z.writeFailed.IsZero() && z.now().Sub(z.writeFailed) < z.tick/2) {
+	backoff := !z.writeFailed.IsZero() && duty <= z.failedDuty &&
+		z.now().Sub(z.writeFailed) < z.tick/2
+	if !send || backoff {
 		return
 	}
 	if err := z.ipmi.SetDuty(ctx, z.cfg.IpmiZone, duty); err != nil {
 		log.Printf("zone %s: %v", z.cfg.Name, err)
-		z.writeFailed = z.now()
+		z.writeFailed, z.failedDuty = z.now(), duty
 		return
 	}
 	z.writeFailed = time.Time{}
@@ -386,7 +406,10 @@ func (z *zoneCtl) loop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return // cancelled polls wake us on shutdown; don't write
 			}
-			z.evaluate(ctx, z.now())
+			// A poll finished, or one may have hit its stuck limit.
+			now := z.now()
+			z.checkStuck(now)
+			z.evaluate(ctx, now)
 		}
 	}
 }

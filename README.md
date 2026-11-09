@@ -23,7 +23,8 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   latest value; it takes the **highest** demand, clamped to
   `min_duty`…`max_duty`. Sources are read in the background, so a slow or
   hung `smartctl` never delays the GPU or the fan writes, and disks are
-  queried in parallel (up to 8 at once).
+  queried in parallel (up to 8 at once). Fan writes themselves run inline,
+  so each `ipmitool` call is cut off after 5 s.
 - **Up fast, down slow.** A higher demand is applied at once. When demand
   drops, the duty is held for `ramp_down_delay` (default 2 min, counted from
   when the drop is first seen), then lowered
@@ -56,12 +57,13 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   lower it or release `startup_duty`: the missing disk may be the hot one.
 - A source that fails to read `fail_after` times in a row (default 3), or
   whose read runs longer than it legitimately can (25 s, or 20 s per batch of
-  8 disks plus 5 s, whatever the poll interval), demands `max_duty` until it
+  8 disks plus 5 s, checked on time whatever the poll interval), demands `max_duty` until it
   recovers. This includes a single disk that stops answering: the fan wall
   goes to 100% and the log says which disk. The first reading after
   recovery isn't averaged with readings from before the failure.
 - A failed fan write is retried at most every half tick, so a hung BMC
-  doesn't block the zone on every reading.
+  doesn't block the zone on every reading. A higher duty (say, a failsafe)
+  is tried at once.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.
 - On shutdown it waits at most 2 s for running reads, so a hung disk can't
@@ -126,7 +128,7 @@ Timing in the example:
 | `cpu` | CPU every 2 s, averaged over 3 | after 30 s, 20 %/min | 50% |
 | `fanwall` | GPU every 5 s, disks every 60 s, both 1 °C hysteresis | after 2 min, 5 %/min | 70% |
 
-Zone keys: `interval` (default for its sources), `min_duty`, `max_duty`,
+Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_duty`,
 `min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
 Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
 `devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),

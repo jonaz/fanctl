@@ -68,6 +68,8 @@ func TestValidateRejects(t *testing.T) {
 		{"fail_after", []Zone{{Name: "a", Sources: []Source{{Type: "cpu", Curve: ok, FailAfter: -1}}}}},
 		{"startup_duty must be between min_duty", []Zone{{Name: "a", MinDuty: 30, StartupDuty: ptr(20), Sources: []Source{{Type: "cpu", Curve: ok}}}}},
 		{"startup_duty must be between min_duty", []Zone{{Name: "a", MaxDuty: 60, StartupDuty: ptr(80), Sources: []Source{{Type: "cpu", Curve: ok}}}}},
+		{"interval must be at least 1s", []Zone{{Name: "a", Interval: Duration{time.Millisecond}, Sources: []Source{{Type: "cpu", Curve: ok}}}}},
+		{"source cpu: interval must be at least 1s", []Zone{{Name: "a", Sources: []Source{{Type: "cpu", Curve: ok, Interval: Duration{500 * time.Millisecond}}}}}},
 	}
 	for i, b := range bad {
 		// Defaults first, as LoadConfig does, so each case reaches its check.
@@ -855,12 +857,11 @@ func TestFloorEnteredMidHoldOnlyRaises(t *testing.T) {
 
 func TestMarkStuckIgnoresFinishedPoll(t *testing.T) {
 	s := newSource(&stubSensor{name: "disks", seq: temps(35)}, time.Second, 0)
-	s.maxDuty = 100
 	s.inFlight.Store(true)
 	s.poll(context.Background()) // delivers and clears inFlight under the lock
 	s.markStuck(time.Minute)     // the stuck check lost the race
-	if real, floor, _ := s.want(); floor != 0 || real == 0 {
-		t.Fatalf("finished poll was failed safe: real %.0f floor %.0f", real, floor)
+	if d, st, _ := s.want(); st != stateOK || d == 0 {
+		t.Fatalf("finished poll was failed safe: state %d demand %.0f", st, d)
 	}
 }
 
@@ -999,4 +1000,71 @@ func TestStuckLimitIndependentOfInterval(t *testing.T) {
 	}
 	close(disk.release)
 	z.wg.Wait()
+}
+
+func TestStuckReadFailsSafeBetweenTicks(t *testing.T) {
+	f := &fakeRunner{}
+	disk := &blockingSensor{started: make(chan struct{}), release: make(chan struct{}), budget: 100 * time.Millisecond}
+	z := newZone(f, newSource(&stubSensor{}, time.Hour, 0)) // next tick in an hour
+	z.sources[0].sensor = disk
+	z.tick = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { z.loop(ctx); close(stopped) }()
+	waitFor(t, f, duty(100)) // at the read budget, not the next tick
+	cancel()
+	close(disk.release)
+	<-stopped
+}
+
+func TestHigherDutySkipsWriteBackoff(t *testing.T) {
+	f := &fakeRunner{err: map[string]error{}}
+	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45, 50)}, time.Second, 0)) // 83 %, then 100 %
+	z.tick = 10 * time.Second
+	clock := time.Now()
+	z.clock = func() time.Time { return clock }
+	f.err["ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53"] = errors.New("bmc hiccup")
+	ctx := context.Background()
+	z.step(ctx, clock)
+	clock = clock.Add(time.Second) // well inside the half-tick backoff
+	z.step(ctx, clock)
+	if lastDuty(f) != duty(100) || z.duty != 100 {
+		t.Fatalf("higher demand held back by the write backoff: %v", f.calls)
+	}
+}
+
+// failingRunner fails every command while fail is set.
+type failingRunner struct {
+	fakeRunner
+	fail atomic.Bool
+}
+
+func (r *failingRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	out, err := r.fakeRunner.Run(ctx, name, args...)
+	if r.fail.Load() {
+		return nil, errors.New("bmc rejects writes")
+	}
+	return out, err
+}
+
+func TestFailsafeHoldSurvivesRejectedWrites(t *testing.T) {
+	r := &failingRunner{}
+	r.fail.Store(true)
+	st := &stubSensor{name: "gpu", seq: []Reading{{}, {Temp: 32}}, errs: []error{errors.New("boom"), nil}}
+	src := newSource(st, time.Second, 0)
+	src.cfg.FailAfter = 1
+	z := newZone(&r.fakeRunner, src)
+	z.ipmi.run = r
+	clock := time.Now()
+	z.clock = func() time.Time { return clock }
+	ctx := context.Background()
+	z.step(ctx, clock) // failsafe: 100 %, write rejected
+	clock = clock.Add(time.Second)
+	z.step(ctx, clock) // recovered at 32 °C (37 %): hold 100, write rejected
+	r.fail.Store(false)
+	clock = clock.Add(time.Second)
+	z.step(ctx, clock)
+	if lastDuty(&r.fakeRunner) != duty(100) {
+		t.Fatalf("failsafe hold lost while no write had succeeded: %v", r.calls)
+	}
 }

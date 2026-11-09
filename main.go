@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	run := execRunner{timeout: readTimeout}
-	ipmi := &IPMI{run: run, bin: cfg.Ipmitool, dryRun: *dryRun || *once}
+	ipmi := &IPMI{run: execRunner{timeout: ipmiTimeout}, bin: cfg.Ipmitool, dryRun: *dryRun || *once}
 
 	zones, err := buildZones(cfg, run, ipmi, exec.LookPath)
 	if err != nil {
@@ -87,7 +87,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 			cfg:       zc,
 			ipmi:      ipmi,
 			reapply:   cfg.Reapply.Duration,
-			startup:   clampRound(float64(*zc.StartupDuty), zc.MinDuty, zc.MaxDuty),
+			startup:   *zc.StartupDuty,
 			rampDelay: zc.RampDownDelay.Duration,
 			rampRate:  *zc.RampDownRate,
 			duty:      -1,
@@ -131,7 +131,7 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 		for _, s := range z.sources {
 			polls = append(polls, fmt.Sprintf("%s every %s", s.sensor.Name(), s.cfg.Interval.Duration))
 		}
-		log.Printf("zone %s: %s; startup %d%%, ramp down after %s at %.0f%%/min",
+		log.Printf("zone %s: %s; startup %d%%, ramp down after %s at %g%%/min",
 			zc.Name, strings.Join(polls, ", "), z.startup, z.rampDelay, z.rampRate)
 		zones = append(zones, z)
 	}
