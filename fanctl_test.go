@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -245,10 +246,16 @@ func waitGone(t *testing.T, pid string) {
 
 func TestRunnerKillsLingeringChild(t *testing.T) {
 	r := execRunner{timeout: 5 * time.Second, waitDelay: 50 * time.Millisecond}
-	// The command exits 0 at once, leaving a child that holds stdout.
+	// The command exits 0 at once, leaving a child that holds stdout: the
+	// output may be incomplete, so the read fails (within the wait delay)
+	// rather than being trusted, and the child is killed.
+	start := time.Now()
 	out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!")
-	if err != nil {
-		t.Fatalf("a lingering child made a successful command fail: %v", err)
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Fatalf("got %v, want exec.ErrWaitDelay: the output can't be trusted", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("returned after %s, want about the 50ms wait delay", took)
 	}
 	waitGone(t, strings.TrimSpace(string(out)))
 }
