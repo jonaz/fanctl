@@ -246,18 +246,26 @@ func waitGone(t *testing.T, pid string) {
 
 func TestRunnerKillsLingeringChild(t *testing.T) {
 	r := execRunner{timeout: 5 * time.Second, waitDelay: 50 * time.Millisecond}
-	// The command exits 0 at once, leaving a child that holds stdout: the
-	// output may be incomplete, so the read fails (within the wait delay)
-	// rather than being trusted, and the child is killed.
-	start := time.Now()
-	out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!")
-	if !errors.Is(err, exec.ErrWaitDelay) {
-		t.Fatalf("got %v, want exec.ErrWaitDelay: the output can't be trusted", err)
+	// The command exits at once, leaving a child that holds stdout. Either
+	// way the output may be incomplete, so the read fails (within the wait
+	// delay) rather than being trusted, and the child is killed.
+	for _, c := range []struct {
+		exit    string
+		wantErr func(error) bool
+	}{
+		{"exit 0", func(err error) bool { return errors.Is(err, exec.ErrWaitDelay) }},
+		{"exit 1", func(err error) bool { var e *exec.ExitError; return errors.As(err, &e) }}, // like smartctl's bitmask
+	} {
+		start := time.Now()
+		out, err := r.Run(context.Background(), "sh", "-c", "sleep 300 & echo $!; "+c.exit)
+		if !c.wantErr(err) {
+			t.Fatalf("%s: got %v (%T)", c.exit, err, err)
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("%s: returned after %s, want about the 50ms wait delay", c.exit, took)
+		}
+		waitGone(t, strings.TrimSpace(string(out)))
 	}
-	if took := time.Since(start); took > time.Second {
-		t.Fatalf("returned after %s, want about the 50ms wait delay", took)
-	}
-	waitGone(t, strings.TrimSpace(string(out)))
 }
 
 func TestRunnerKillsGroupOnTimeout(t *testing.T) {

@@ -25,11 +25,18 @@ type execRunner struct {
 
 // Run runs the command in a process group of its own, so a child it forked
 // can neither hang the read nor outlive it: the group is killed on timeout,
-// and after a child kept the output pipes open past the command's exit.
-// The group is only signalled while its id is known to be in use (the
-// command unreaped, or a child just seen holding the pipes), never after
-// it may have been freed and reused. (A process stuck in the kernel can
-// still hang Wait; the controller's stuck-read check covers that.)
+// and after any failed run (a child holding the pipes past the command's
+// exit shows up as ErrWaitDelay after a clean exit, but as a plain
+// ExitError after a failing one; smartctl fails routinely). A successful
+// run leaves nothing to clean up. (A process stuck in the kernel can still
+// hang Wait; the controller's stuck-read check covers that.)
+//
+// The cleanup kill comes after Wait has reaped the command, as os/exec
+// offers no point in between. While any child lives, the group id stays
+// taken, so the kill reaches only our group. With none left it is ESRCH,
+// unless the id was freed and handed to a new group leader in the
+// microseconds since; Linux allocates pids cyclically, so that would take
+// a full pass through pid_max in that time.
 //
 // exec.ErrWaitDelay is returned as is: the pipes were closed before EOF,
 // so the output may be incomplete and must not be trusted.
@@ -51,10 +58,8 @@ func (r execRunner) Run(ctx context.Context, name string, args ...string) ([]byt
 		cmd.WaitDelay = r.waitDelay
 	}
 	out, err := cmd.Output()
-	if errors.Is(err, exec.ErrWaitDelay) {
-		// A child held the pipes until just now, so the group still has a
-		// member and its id can't have been reused: kill what is left.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if err != nil && cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // leftover children
 	}
 	return out, err
 }
