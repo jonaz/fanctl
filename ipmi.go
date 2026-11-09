@@ -70,6 +70,11 @@ func (i *IPMI) raw(ctx context.Context, netfn, cmd byte, data ...byte) error {
 		return fmt.Errorf("%s %s: waiting for an earlier IPMI command: %w", i.t.name(), req, wait.Err())
 	}
 	defer func() { <-i.busy }()
+	// select picks at random when both are ready: a cancelled call may
+	// still have got the lock, and must not then reach the BMC.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s %s: %w", i.t.name(), req, err)
+	}
 	if err := i.t.raw(ctx, netfn, cmd, data); err != nil {
 		return fmt.Errorf("%s %s: %w", i.t.name(), req, err)
 	}

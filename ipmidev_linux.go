@@ -110,7 +110,7 @@ func openIPMIDevice(path string) (*ipmiDevice, error) {
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	switch {
 	case errors.Is(err, syscall.ENOENT):
-		return nil, fmt.Errorf("open %s: %w; load the IPMI driver with `modprobe ipmi_si ipmi_devintf`, or set \"ipmi\": \"ipmitool\" in the config", path, err)
+		return nil, fmt.Errorf("open %s: %w; load the IPMI driver with `modprobe -a ipmi_si ipmi_devintf`, or set \"ipmi\": \"ipmitool\" in the config", path, err)
 	case errors.Is(err, syscall.EACCES):
 		return nil, fmt.Errorf("open %s: %w; fanctl must run as root", path, err)
 	case err != nil:

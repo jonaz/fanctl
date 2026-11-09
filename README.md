@@ -88,7 +88,7 @@ The IPMI device needs the `ipmi_si` and `ipmi_devintf` kernel modules (the
 same ones `ipmitool` uses). Load them now and at every boot:
 
 ```bash
-sudo modprobe ipmi_si ipmi_devintf
+sudo modprobe -a ipmi_si ipmi_devintf
 printf 'ipmi_si\nipmi_devintf\n' | sudo tee /etc/modules-load.d/ipmi.conf
 ```
 

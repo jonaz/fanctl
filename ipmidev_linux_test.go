@@ -237,6 +237,26 @@ func TestIPMIDeviceHonoursContext(t *testing.T) {
 	})
 }
 
+// A cancelled call never reaches the BMC, even though the lock is free and
+// select may pick it over the cancellation.
+func TestCancelledCallSendsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	k := &fakeKernel{reply: answer(0)}
+	f := &fakeRunner{}
+	for _, tr := range []transport{fakeDevice(k), ipmitool{run: f, bin: "ipmitool"}} {
+		ipmi := newIPMI(tr, false)
+		for range 50 { // select's choice is random: give it every chance
+			if err := ipmi.SetDuty(ctx, 1, 50); !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s: got %v, want context.Canceled", tr.name(), err)
+			}
+		}
+	}
+	if len(k.sent) != 0 || f.n() != 0 {
+		t.Fatalf("cancelled calls sent %d device requests and %d ipmitool commands", len(k.sent), f.n())
+	}
+}
+
 func TestIPMIDeviceRetriesEINTR(t *testing.T) {
 	k := &fakeKernel{reply: answer(0)}
 	interrupted := 0
@@ -258,7 +278,7 @@ func TestIPMIDeviceRetriesEINTR(t *testing.T) {
 
 func TestOpenIPMIDeviceMissing(t *testing.T) {
 	_, err := openIPMIDevice(t.TempDir() + "/ipmi0")
-	if err == nil || !strings.Contains(err.Error(), "modprobe ipmi_si ipmi_devintf") || !strings.Contains(err.Error(), `"ipmi": "ipmitool"`) {
+	if err == nil || !strings.Contains(err.Error(), "modprobe -a ipmi_si ipmi_devintf") || !strings.Contains(err.Error(), `"ipmi": "ipmitool"`) {
 		t.Fatalf("got %v, want a hint to load the modules or use ipmitool", err)
 	}
 }

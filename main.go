@@ -90,7 +90,7 @@ func newBMC(cfg *Config, dryRun bool) (*IPMI, func(), error) {
 		return newIPMI(ipmitool{run: execRunner{timeout: ipmiTimeout}, bin: cfg.Ipmitool}, dryRun), func() {}, nil
 	case dryRun:
 		if _, err := os.Stat(cfg.IpmiDevice); err != nil {
-			log.Printf("warning: %v; a real run would fail (modprobe ipmi_si ipmi_devintf, or set \"ipmi\": \"ipmitool\")", err)
+			log.Printf("warning: %v; a real run would fail (modprobe -a ipmi_si ipmi_devintf, or set \"ipmi\": \"ipmitool\")", err)
 		}
 		return newIPMI(nil, true), func() {}, nil
 	}
