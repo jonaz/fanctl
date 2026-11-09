@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync"
+	"time"
 )
 
 // IPMI sets Supermicro X10/X11 fan mode and per-zone duty via ipmitool raw.
@@ -15,11 +15,15 @@ type IPMI struct {
 	dryRun bool
 
 	// One raw command at a time: the BMC dislikes concurrent ones. A
-	// channel, not a mutex, so a caller can give up waiting: an ipmitool
-	// stuck in the kernel must not keep shutdown from restoring the fan
-	// mode, nor hang the other zone's writer for good.
-	once sync.Once
-	busy chan struct{}
+	// channel, not a mutex, so waiting can give up after lockWait: an
+	// ipmitool stuck in the kernel must not keep shutdown from restoring
+	// the fan mode, nor hang the other zone's writer for good.
+	busy     chan struct{}
+	lockWait time.Duration
+}
+
+func newIPMI(run Runner, bin string, dryRun bool) *IPMI {
+	return &IPMI{run: run, bin: bin, dryRun: dryRun, busy: make(chan struct{}, 1), lockWait: ipmiTimeout}
 }
 
 func (i *IPMI) raw(ctx context.Context, bytes ...int) error {
@@ -31,11 +35,12 @@ func (i *IPMI) raw(ctx context.Context, bytes ...int) error {
 		log.Printf("dry-run: %s %s", i.bin, strings.Join(args, " "))
 		return nil
 	}
-	i.once.Do(func() { i.busy = make(chan struct{}, 1) })
+	wait, cancel := context.WithTimeout(ctx, i.lockWait)
+	defer cancel()
 	select {
 	case i.busy <- struct{}{}:
-	case <-ctx.Done():
-		return fmt.Errorf("%s %s: waiting for an earlier ipmitool: %w", i.bin, strings.Join(args, " "), ctx.Err())
+	case <-wait.Done():
+		return fmt.Errorf("%s %s: waiting for an earlier ipmitool: %w", i.bin, strings.Join(args, " "), wait.Err())
 	}
 	defer func() { <-i.busy }()
 	out, err := i.run.Run(ctx, i.bin, args...)

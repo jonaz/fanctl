@@ -66,7 +66,7 @@ type Source struct {
 	// Curve points as [temp °C, duty %], sorted by temperature.
 	Curve [][2]float64 `json:"curve"`
 	// Poll interval for this source; defaults to the zone's interval.
-	Interval Duration `json:"interval,omitempty"`
+	Interval Duration `json:"interval,omitzero"`
 	// A falling temperature is only followed once it has dropped more than
 	// this many °C. 1 stops whole-degree sensors flickering 40↔41.
 	Hysteresis float64 `json:"hysteresis,omitempty"`
@@ -160,6 +160,9 @@ func (c *Config) Validate() error {
 		if _, ok := fanModes[c.ExitMode]; !ok {
 			return fmt.Errorf("exit_mode %q: want standard, full, optimal, heavyio or empty", c.ExitMode)
 		}
+	}
+	if c.Reapply.Duration < minInterval {
+		return fmt.Errorf("reapply must be at least %s", minInterval)
 	}
 	if len(c.Zones) == 0 {
 		return errors.New("no zones configured")

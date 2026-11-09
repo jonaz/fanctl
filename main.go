@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	run := execRunner{timeout: readTimeout}
-	ipmi := &IPMI{run: execRunner{timeout: ipmiTimeout}, bin: cfg.Ipmitool, dryRun: *dryRun || *once}
+	ipmi := newIPMI(execRunner{timeout: ipmiTimeout}, cfg.Ipmitool, *dryRun || *once)
 
 	zones, err := buildZones(cfg, run, ipmi, exec.LookPath)
 	if err != nil {
@@ -117,9 +117,6 @@ func buildZones(cfg *Config, run Runner, ipmi *IPMI, lookPath lookPathFunc) ([]*
 				sen = &gpuSensor{run: run, bin: cfg.NvidiaSmi}
 			}
 			z.addSource(&source{cfg: sc, sensor: sen, avg: window{size: zc.Smoothing}})
-			if z.tick == 0 || sc.Interval.Duration < z.tick {
-				z.tick = sc.Interval.Duration
-			}
 		}
 		if len(z.sources) == 0 {
 			return nil, fmt.Errorf("zone %s: no usable sources", zc.Name)

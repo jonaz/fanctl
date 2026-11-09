@@ -18,11 +18,11 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   the duty cycles it sets.
 - Every source is polled on its own `interval` (the GPU every few seconds, the
   disks every minute) and turns its temperature into a duty through a curve
-  (linear between points). The zone re-evaluates at its fastest source's
-  interval, and again as soon as any reading arrives, using each source's
-  latest value; it takes the **highest** demand, clamped to
-  `min_duty`…`max_duty`. Sources are read in the background, so a slow or
-  hung `smartctl` never delays the GPU or the fan writes, and disks are
+  (linear between points). The zone re-evaluates every second and as soon
+  as any reading arrives, using each source's latest value; it takes the
+  **highest** demand, clamped to `min_duty`…`max_duty`. Each source polls
+  on its own timer in the background, so a slow or hung `smartctl` never
+  delays the GPU or the fan writes, and disks are
   queried in parallel (up to 8 at once). Fan writes run on their own too
   (always the latest duty), so a hung BMC never holds up polling; each
   `ipmitool` call is cut off after 5 s.
@@ -63,7 +63,8 @@ No dependencies beyond `ipmitool`, `smartctl` (smartmontools) and, for the GPU,
   goes to 100% and the log says which disk. The first reading after
   recovery isn't averaged with readings from before the failure.
 - A failed fan write is retried after 1 s, doubling up to 30 s, so a hung
-  BMC isn't hammered. A higher duty (say, a failsafe) is tried at once.
+  BMC isn't hammered. Only a jump to `max_duty` (say, a failsafe) is tried
+  at once.
 - `optional: true` on a source skips it at startup if its tool is missing
   (used for the GPU), instead of failing safe.
 - On shutdown it waits at most 2 s for running reads, so a hung disk can't
@@ -132,7 +133,7 @@ Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_
 `min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
 Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
 `devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),
-`hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` and tool paths
+`hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` (at least 1 s) and tool paths
 `ipmitool`, `smartctl`, `nvidia_smi`.
 
 Tune the disk curve with your temperature graph: if the hottest disk sits above

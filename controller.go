@@ -7,7 +7,6 @@ import (
 	"math"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -26,9 +25,6 @@ const (
 type source struct {
 	cfg    Source
 	sensor Sensor
-
-	next     time.Time   // when to poll next; zero = poll now
-	inFlight atomic.Bool // a background poll is running
 
 	mu       sync.Mutex // guards the fields below
 	peak     float64    // highest demand since want() last ran; -1 = none
@@ -53,7 +49,6 @@ func (s *source) pollWatched(ctx context.Context, finished chan struct{}) {
 	r, err := s.sensor.Read(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	defer s.inFlight.Store(false)
 	if finished != nil {
 		defer close(finished)
 	}
@@ -217,43 +212,26 @@ func (s *source) current() float64 {
 	return s.demand
 }
 
-// due reports whether the source should be polled at now. Half a tick of
-// slack so ticker jitter never skips a poll.
-func (s *source) due(now time.Time, tick time.Duration) bool {
-	return s.next.IsZero() || !now.Before(s.next.Add(-tick/2))
-}
-
-// schedule advances the deadline from the previous one, skipping missed
-// slots, so rounding to ticks keeps the configured average interval.
-func (s *source) schedule(now time.Time) {
-	if s.next.IsZero() {
-		s.next = now
-	}
-	iv := s.cfg.Interval.Duration
-	if s.next = s.next.Add(iv); !s.next.After(now) {
-		s.next = s.next.Add((now.Sub(s.next)/iv + 1) * iv) // first slot after now
-	}
-}
-
 // zoneCtl runs one fan zone. Three kinds of goroutine share it in the loop:
 //
-//   - the loop itself owns the schedule and the ramp (evaluate);
-//   - one goroutine per running poll reads a sensor and updates its source;
+//   - the loop itself owns the ramp (evaluate), run every tick and whenever
+//     a poll lands;
+//   - one goroutine per source polls it on its own ticker, so a slow sensor
+//     (a hung disk) never delays the others, and wakes the loop;
 //   - the writer puts the duty on the fans, so a slow or hung BMC never
 //     stalls polling or the ramp. evaluate posts the duty it wants into a
 //     mailbox of one; the writer always sends the latest.
 //
-// Inline (tests, --once) the same code runs on the caller's goroutine.
+// Inline (tests, --once) step polls and writes on the caller's goroutine.
 type zoneCtl struct {
 	cfg     Zone
 	sources []*source
 	ipmi    *IPMI
 	reapply time.Duration
-	tick    time.Duration    // loop period: the shortest source interval
-	async   bool             // poll in the background (set by loop); else inline
+	tick    time.Duration    // how often loop evaluates without a poll; 0 = evalTick
 	clock   func() time.Time // nil = time.Now; tests set a fake
-	wg      sync.WaitGroup   // background polls and the writer
-	done    chan struct{}    // a background poll finished; nil = nobody listens
+	wg      sync.WaitGroup   // pollers and the writer
+	done    chan struct{}    // a poll landed or got stuck; nil = nobody listens
 
 	// The ramp, owned by evaluate.
 	level    float64   // internal duty; ramps down smoothly between whole percents
@@ -270,7 +248,7 @@ type zoneCtl struct {
 	lastSent   time.Time
 	failures   int       // failed writes in a row
 	retryAt    time.Time // when the last failed write may be retried
-	failedDuty int       // what it tried to send; a higher duty doesn't wait
+	failedDuty int       // what it tried to send
 }
 
 // order is what evaluate wants on the fans.
@@ -297,36 +275,38 @@ func (z *zoneCtl) wake() {
 	}
 }
 
-// step polls the sources that are due and updates the fans.
-//
-// Inline it polls first, then evaluates. In the background it evaluates
-// first and starts the polls: a slow sensor (a hung disk) must not delay
-// the others, and each finished poll wakes the loop to evaluate again.
+// step polls every source once, inline, then evaluates: --once and tests.
 func (z *zoneCtl) step(ctx context.Context, now time.Time) {
-	if !z.async {
-		for _, s := range z.sources {
-			if s.due(now, z.tick) {
-				s.poll(ctx)
-				s.schedule(now)
-			}
-		}
-		z.evaluate(ctx, now)
-		return
+	for _, s := range z.sources {
+		s.poll(ctx)
 	}
 	z.evaluate(ctx, now)
-	for _, s := range z.sources {
-		if !s.due(now, z.tick) || !s.inFlight.CompareAndSwap(false, true) {
-			continue // not due, or the previous poll is still running
+}
+
+// pollEvery polls s on its own ticker until ctx ends, under a watchdog,
+// waking the loop after each poll. A poll running past the next tick
+// delays it (time.Ticker drops the missed ones), so polls never overlap.
+func (z *zoneCtl) pollEvery(ctx context.Context, s *source) {
+	t := time.NewTicker(s.cfg.Interval.Duration)
+	defer t.Stop()
+	for {
+		finished := make(chan struct{})
+		go s.watch(finished, z.wake)
+		s.pollWatched(ctx, finished)
+		z.wake()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
 		}
+	}
+}
+
+// startPolling starts one pollEvery goroutine per source.
+func (z *zoneCtl) startPolling(ctx context.Context) {
+	for _, s := range z.sources {
 		z.wg.Add(1)
-		go func(s *source) {
-			defer z.wg.Done()
-			finished := make(chan struct{})
-			go s.watch(finished, z.wake)
-			s.pollWatched(ctx, finished) // clears inFlight, closes finished
-			z.wake()
-		}(s)
-		s.schedule(now)
+		go func() { defer z.wg.Done(); z.pollEvery(ctx, s) }()
 	}
 }
 
@@ -399,8 +379,7 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 }
 
 // Failed writes are retried after retryMin, doubling up to retryMax, so a
-// hung BMC isn't hammered. A higher duty than the one that failed (a
-// failsafe, say) is tried at once.
+// hung BMC isn't hammered.
 const (
 	retryMin = time.Second
 	retryMax = 30 * time.Second
@@ -443,7 +422,10 @@ func (z *zoneCtl) flush(ctx context.Context, now time.Time) time.Duration {
 	if !send {
 		return reapplyIn
 	}
-	if wait := z.retryAt.Sub(now); z.failures > 0 && o.duty <= z.failedDuty && wait > 0 {
+	// Only a jump to max_duty (a failsafe, say) skips the wait: a merely
+	// rising demand would otherwise retry a hung BMC on every evaluate.
+	urgent := o.duty == z.cfg.MaxDuty && z.failedDuty < z.cfg.MaxDuty
+	if wait := z.retryAt.Sub(now); z.failures > 0 && !urgent && wait > 0 {
 		return wait
 	}
 	start := time.Now()
@@ -456,7 +438,7 @@ func (z *zoneCtl) flush(ctx context.Context, now time.Time) time.Duration {
 		// From the end of the attempt: a hung call took its whole timeout.
 		z.retryAt = now.Add(time.Since(start) + retryDelay(z.failures))
 		z.failedDuty = o.duty
-		return z.retryAt.Sub(now)
+		return retryDelay(z.failures) // the writer's timer starts after the call
 	}
 	z.failures = 0
 	if changed {
@@ -498,34 +480,38 @@ func (z *zoneCtl) now() time.Time {
 // for it would keep main from restoring the BMC fan mode.
 const shutdownWait = 2 * time.Second
 
+// evalTick is how often the loop evaluates between polls, so holds and
+// ramp-downs move on time even in a zone whose sources poll every minute.
+// Evaluating is cheap: the writer only talks to the BMC when it must.
+const evalTick = time.Second
+
 func (z *zoneCtl) loop(ctx context.Context) {
-	z.async = true
 	z.done = make(chan struct{}, 1)
 	z.kick = make(chan struct{}, 1)
 	z.wg.Add(1)
 	go func() { defer z.wg.Done(); z.writer(ctx) }()
 	defer z.waitWorkers(shutdownWait)
-	z.step(ctx, z.now())
-	t := time.NewTicker(z.tick)
+	z.evaluate(ctx, z.now()) // startup duty at once
+	z.startPolling(ctx)
+	tick := z.tick
+	if tick == 0 {
+		tick = evalTick
+	}
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			// Not the tick's own timestamp: a buffered tick can be older
-			// than a completion already handled, and time must not go
-			// backwards for the ramp.
-			if ctx.Err() != nil {
-				return // a tick buffered at shutdown: no new polls
-			}
-			z.step(ctx, z.now())
-		case <-z.done:
-			if ctx.Err() != nil {
-				return // cancelled polls wake us on shutdown
-			}
-			z.evaluate(ctx, z.now()) // a poll finished, or one is stuck
+		case <-z.done: // a poll landed, or one is stuck
 		}
+		// Not the tick's own timestamp: a buffered tick can be older than a
+		// wakeup already handled, and time must not go backwards for the ramp.
+		if ctx.Err() != nil {
+			return // woken at shutdown: no more writes
+		}
+		z.evaluate(ctx, z.now())
 	}
 }
 
