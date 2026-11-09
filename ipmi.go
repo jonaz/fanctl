@@ -13,7 +13,13 @@ type IPMI struct {
 	run    Runner
 	bin    string
 	dryRun bool
-	mu     sync.Mutex // the BMC dislikes concurrent raw commands
+
+	// One raw command at a time: the BMC dislikes concurrent ones. A
+	// channel, not a mutex, so a caller can give up waiting: an ipmitool
+	// stuck in the kernel must not keep shutdown from restoring the fan
+	// mode, nor hang the other zone's writer for good.
+	once sync.Once
+	busy chan struct{}
 }
 
 func (i *IPMI) raw(ctx context.Context, bytes ...int) error {
@@ -25,8 +31,13 @@ func (i *IPMI) raw(ctx context.Context, bytes ...int) error {
 		log.Printf("dry-run: %s %s", i.bin, strings.Join(args, " "))
 		return nil
 	}
-	i.mu.Lock()
-	defer i.mu.Unlock()
+	i.once.Do(func() { i.busy = make(chan struct{}, 1) })
+	select {
+	case i.busy <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("%s %s: waiting for an earlier ipmitool: %w", i.bin, strings.Join(args, " "), ctx.Err())
+	}
+	defer func() { <-i.busy }()
 	out, err := i.run.Run(ctx, i.bin, args...)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w (%s)", i.bin, strings.Join(args, " "), err, strings.TrimSpace(string(out)))

@@ -43,13 +43,20 @@ type source struct {
 
 // poll reads the sensor once and updates the source's state. The read
 // itself runs unlocked, so a slow sensor never blocks the zone.
-func (s *source) poll(ctx context.Context) {
+func (s *source) poll(ctx context.Context) { s.pollWatched(ctx, nil) }
+
+// pollWatched is poll for a background read guarded by watch: finished
+// (nil = unwatched) is closed under the lock as the result lands, so that
+// read's watchdog can never fail safe a poll that has delivered, nor the
+// one started after it.
+func (s *source) pollWatched(ctx context.Context, finished chan struct{}) {
 	r, err := s.sensor.Read(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Cleared under the lock, so markStuck can't fail safe a poll that
-	// has just delivered its result.
 	defer s.inFlight.Store(false)
+	if finished != nil {
+		defer close(finished)
+	}
 	if ctx.Err() != nil {
 		return // shutting down: a cancelled read is not a sensor failure
 	}
@@ -80,7 +87,7 @@ func (s *source) failsafe(frag string) {
 // never does. Runs alongside the read until finished is closed. The limit
 // is looked up again when the timer fires, so disks detected during the
 // read extend it.
-func (s *source) watch(finished <-chan struct{}, wake func()) {
+func (s *source) watch(finished chan struct{}, wake func()) {
 	start := time.Now()
 	t := time.NewTimer(s.stuckLimit())
 	defer t.Stop()
@@ -93,19 +100,25 @@ func (s *source) watch(finished <-chan struct{}, wake func()) {
 				t.Reset(rem) // the limit grew meanwhile
 				continue
 			}
-			s.markStuck(time.Since(start))
+			s.markStuck(finished, time.Since(start))
 			wake()
 			return
 		}
 	}
 }
 
-// markStuck fails a source safe whose poll has been running too long.
-func (s *source) markStuck(running time.Duration) {
+// markStuck fails a source safe whose poll (identified by its finished
+// channel) has been running too long.
+func (s *source) markStuck(finished chan struct{}, running time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.inFlight.Load() || s.state == stateFailsafe {
-		return // finished meanwhile, or already failed safe
+	select {
+	case <-finished:
+		return // that poll delivered meanwhile
+	default:
+	}
+	if s.state == stateFailsafe {
+		return // already failed safe
 	}
 	s.failsafe(s.sensor.Name() + "=STUCK")
 	log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), running.Round(time.Second))
@@ -256,16 +269,16 @@ type zoneCtl struct {
 	duty       int // last duty the BMC accepted, -1 = none yet
 	lastSent   time.Time
 	failures   int       // failed writes in a row
-	failedAt   time.Time // when the last write failed
-	failedDuty int       // what it tried to send
+	retryAt    time.Time // when the last failed write may be retried
+	failedDuty int       // what it tried to send; a higher duty doesn't wait
 }
 
 // order is what evaluate wants on the fans.
 type order struct {
 	valid  bool
 	duty   int
-	target int    // where the ramp is heading
-	parts  string // per-source readings, for the log
+	target int      // where the ramp is heading
+	parts  []string // per-source readings, for the log
 }
 
 func (z *zoneCtl) addSource(s *source) {
@@ -310,8 +323,7 @@ func (z *zoneCtl) step(ctx context.Context, now time.Time) {
 			defer z.wg.Done()
 			finished := make(chan struct{})
 			go s.watch(finished, z.wake)
-			s.poll(ctx) // clears inFlight
-			close(finished)
+			s.pollWatched(ctx, finished) // clears inFlight, closes finished
 			z.wake()
 		}(s)
 		s.schedule(now)
@@ -373,7 +385,7 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 		valid:  true,
 		duty:   clampRound(math.Max(z.level, floor), z.cfg.MinDuty, z.cfg.MaxDuty),
 		target: target,
-		parts:  strings.Join(parts, " "),
+		parts:  parts,
 	}
 	z.mu.Unlock()
 	if z.kick == nil {
@@ -393,6 +405,16 @@ const (
 	retryMin = time.Second
 	retryMax = 30 * time.Second
 )
+
+// retryDelay is the wait after n failed writes in a row (n >= 1). Doubling
+// stops at retryMax, so no number of failures can overflow it.
+func retryDelay(n int) time.Duration {
+	d := retryMin
+	for i := 1; i < n && d < retryMax; i++ {
+		d *= 2
+	}
+	return min(d, retryMax)
+}
 
 // flush sends the posted duty if it is worth sending, and returns how long
 // until it should look again (0 = only when a new duty is posted).
@@ -421,11 +443,8 @@ func (z *zoneCtl) flush(ctx context.Context, now time.Time) time.Duration {
 	if !send {
 		return reapplyIn
 	}
-	if z.failures > 0 && o.duty <= z.failedDuty {
-		backoff := min(retryMin<<(z.failures-1), retryMax)
-		if wait := z.failedAt.Add(backoff).Sub(now); wait > 0 {
-			return wait
-		}
+	if wait := z.retryAt.Sub(now); z.failures > 0 && o.duty <= z.failedDuty && wait > 0 {
+		return wait
 	}
 	start := time.Now()
 	if err := z.ipmi.SetDuty(ctx, z.cfg.IpmiZone, o.duty); err != nil {
@@ -435,12 +454,13 @@ func (z *zoneCtl) flush(ctx context.Context, now time.Time) time.Duration {
 		log.Printf("zone %s: %v", z.cfg.Name, err)
 		z.failures++
 		// From the end of the attempt: a hung call took its whole timeout.
-		z.failedAt, z.failedDuty = now.Add(time.Since(start)), o.duty
-		return min(retryMin<<(z.failures-1), retryMax)
+		z.retryAt = now.Add(time.Since(start) + retryDelay(z.failures))
+		z.failedDuty = o.duty
+		return z.retryAt.Sub(now)
 	}
 	z.failures = 0
 	if changed {
-		log.Printf("zone %s: %d%% (target %d%%) [%s]", z.cfg.Name, o.duty, o.target, o.parts)
+		log.Printf("zone %s: %d%% (target %d%%) [%s]", z.cfg.Name, o.duty, o.target, strings.Join(o.parts, " "))
 	}
 	z.duty, z.lastSent = o.duty, now
 	return z.reapply

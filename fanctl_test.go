@@ -809,9 +809,11 @@ func TestFloorEnteredMidHoldOnlyRaises(t *testing.T) {
 
 func TestMarkStuckIgnoresFinishedPoll(t *testing.T) {
 	s := newSource(&stubSensor{name: "disks", seq: temps(35)}, time.Second, 0)
+	finished := make(chan struct{})
 	s.inFlight.Store(true)
-	s.poll(context.Background()) // delivers and clears inFlight under the lock
-	s.markStuck(time.Minute)     // the stuck check lost the race
+	s.pollWatched(context.Background(), finished) // delivers and closes finished under the lock
+	s.inFlight.Store(true)                        // the next poll has already started
+	s.markStuck(finished, time.Minute)            // the old poll's watchdog lost the race
 	if d, st, _ := s.want(); st != stateOK || d == 0 {
 		t.Fatalf("finished poll was failed safe: state %d demand %.0f", st, d)
 	}
@@ -1146,9 +1148,10 @@ func TestFailsafeReasonSurvivesErrors(t *testing.T) {
 	st := &stubSensor{name: "disks", seq: []Reading{{}}, errs: []error{errors.New("timeout")}}
 	z := newZone(&fakeRunner{}, newSource(st, time.Second, 0))
 	s := z.sources[0]
+	finished := make(chan struct{})
 	s.inFlight.Store(true)
-	s.markStuck(time.Minute)
-	s.poll(context.Background()) // the stuck read finally fails
+	s.markStuck(finished, time.Minute)
+	s.pollWatched(context.Background(), finished) // the stuck read finally fails
 	if _, st, frag := s.want(); st != stateFailsafe || frag != "disks=STUCK" {
 		t.Fatalf("state %d, log %q: want failsafe with the STUCK reason", st, frag)
 	}
@@ -1172,5 +1175,44 @@ func TestScheduleAfterLongStall(t *testing.T) {
 	s.schedule(s.next) // exactly on the slot: the next one
 	if want := t0.Add(24*time.Hour + 2*time.Second); !s.next.Equal(want) {
 		t.Fatalf("next poll %s after t0, want %s", s.next.Sub(t0), want.Sub(t0))
+	}
+}
+
+func TestRetryDelayNeverOverflows(t *testing.T) {
+	for n, want := range map[int]time.Duration{1: time.Second, 2: 2 * time.Second, 5: 16 * time.Second, 6: retryMax, 35: retryMax, 100: retryMax} {
+		if got := retryDelay(n); got != want {
+			t.Errorf("retryDelay(%d) = %s, want %s", n, got, want)
+		}
+	}
+	f := &fakeRunner{err: map[string]error{"ipmitool raw 0x30 0x70 0x66 0x01 0x01 0x53": errors.New("bmc down")}}
+	z := newZone(f, newSource(&stubSensor{name: "gpu", seq: temps(45)}, time.Second, 0))
+	z.failures, z.failedDuty = 99, 83 // a long outage
+	z.retryAt = time.Now()
+	z.step(context.Background(), z.retryAt)
+	// retryMax from the end of the attempt, so a hair over it.
+	if wait := z.flush(context.Background(), z.retryAt); wait < retryMax || wait > retryMax+time.Second {
+		t.Fatalf("after 100 failures the writer waits %s, want about %s", wait, retryMax)
+	}
+}
+
+func TestIPMIWaitForLockHonoursContext(t *testing.T) {
+	bmc := &hungBMC{release: make(chan struct{})}
+	defer close(bmc.release)
+	ipmi := &IPMI{run: bmc, bin: "ipmitool"}
+	go ipmi.SetDuty(context.Background(), 1, 50) // stuck in the kernel, holding the lock
+	for bmc.calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- ipmi.SetMode(ctx, fanModes["optimal"]) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("SetMode succeeded while another ipmitool held the lock")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SetMode ignored its context while waiting for the lock")
 	}
 }

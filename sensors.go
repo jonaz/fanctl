@@ -92,8 +92,9 @@ func (s *diskSensor) maxReadTime() time.Duration {
 const readTimeout = 20 * time.Second
 
 // ipmiTimeout bounds each ipmitool command. A raw command takes well under
-// a second; a hung BMC must not stall the zone loops (which write inline
-// and share one IPMI lock) for as long as a slow disk may take.
+// a second. Writes run in each zone's writer goroutine, but both zones and
+// the exit-mode restore share one IPMI lock, so a hung BMC must give it up
+// sooner than a slow disk read would.
 const ipmiTimeout = 5 * time.Second
 
 // readBudget is how long a read made of n rounds of commands may take:
