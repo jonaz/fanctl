@@ -179,6 +179,23 @@ func TestHwmonDiskSensorDrivetempNotLoaded(t *testing.T) {
 	}
 }
 
+// An autodetected disk whose sensor goes away (drivetemp still loaded, say
+// after an unbind) is a failed read, not a disk without a sensor: it may
+// have been the hottest. sdc, which never had one, is still left out.
+func TestHwmonDiskSensorLostSensor(t *testing.T) {
+	root := fakeDiskSysfs(t)
+	s := &hwmonDiskSensor{}
+	if r, err := s.Read(context.Background()); err != nil || r.Temp != 45 || r.Partial != nil {
+		t.Fatalf("got %+v, %v; want 45 from /dev/sdb", r, err)
+	}
+	os.RemoveAll(filepath.Join(root, "sys/class/hwmon/hwmon2"))
+	r, err := s.Read(context.Background())
+	if err != nil || r.Temp != 41 || r.Partial == nil || r.Partial.Error() != "/dev/sdb: drivetemp sensor gone" ||
+		r.Detail != "hottest /dev/sda, 1 without sensor" {
+		t.Fatalf("got %+v, %v; want 41 with only /dev/sdb failed", r, err)
+	}
+}
+
 func TestHwmonDiskSensorBadRead(t *testing.T) {
 	root := fakeDiskSysfs(t)
 	os.WriteFile(filepath.Join(root, "sys/class/hwmon/hwmon2/temp1_input"), []byte("garbage\n"), 0o644)

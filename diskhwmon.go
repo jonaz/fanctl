@@ -45,6 +45,9 @@ type hwmonDiskSensor struct {
 
 	mu   sync.Mutex
 	busy map[string]time.Time // hwmon dirs with a read running, since when
+	// monitored holds the disks that have had a sensor. One that loses it
+	// is a failed read, not a disk without a sensor.
+	monitored map[string]bool
 }
 
 func (s *hwmonDiskSensor) Name() string { return "disks" }
@@ -106,6 +109,7 @@ func drivetempLoaded() bool {
 // diskPlan is what one read covers.
 type diskPlan struct {
 	hw       []diskHwmon // to read, each once
+	covered  []string    // disks with a sensor in hw
 	failed   []string    // disks that should have a sensor but don't
 	noSensor []string    // autodetected SATA disks drivetemp found no sensor on
 }
@@ -114,8 +118,9 @@ type diskPlan struct {
 // non-removable ones) with their hwmon. Without drivetemp loaded no SATA
 // disk has one, so each counts as failed. With it loaded, an autodetected
 // SATA disk without one has no sensor drivetemp can use (some older SSDs,
-// SAS disks) and is left out; a listed one is still an error.
-func planDisks(devices []string) diskPlan {
+// SAS disks) and is left out, unless it is in monitored (it had one: its
+// sensor went away); a listed one is always an error.
+func planDisks(devices []string, monitored map[string]bool) diskPlan {
 	// With NVMe multipath several controllers (hwmons) share one disk:
 	// all of them are read, so the hottest counts.
 	byDisk := map[string][]diskHwmon{}
@@ -142,6 +147,7 @@ func planDisks(devices []string) diskPlan {
 	picked := map[string]bool{}
 	for i, name := range names {
 		if hs := byDisk[name]; len(hs) > 0 {
+			p.covered = append(p.covered, name)
 			for _, h := range hs {
 				if !picked[h.dir] {
 					picked[h.dir] = true
@@ -155,6 +161,8 @@ func planDisks(devices []string) diskPlan {
 		switch {
 		case isSD && !loaded:
 			p.failed = append(p.failed, label+": drivetemp not loaded (modprobe drivetemp)")
+		case isSD && len(devices) == 0 && monitored[name]:
+			p.failed = append(p.failed, label+": drivetemp sensor gone")
 		case isSD && len(devices) == 0:
 			p.noSensor = append(p.noSensor, name)
 		case isSD:
@@ -167,7 +175,15 @@ func planDisks(devices []string) diskPlan {
 }
 
 func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
-	plan := planDisks(s.devices)
+	s.mu.Lock()
+	plan := planDisks(s.devices, s.monitored)
+	if s.monitored == nil {
+		s.monitored = map[string]bool{}
+	}
+	for _, d := range plan.covered {
+		s.monitored[d] = true
+	}
+	s.mu.Unlock()
 	hw, failed := plan.hw, plan.failed
 	if len(hw) == 0 && len(failed) == 0 {
 		return Reading{}, errors.New("no disk with a temperature sensor")

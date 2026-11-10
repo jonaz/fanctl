@@ -117,7 +117,7 @@ func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zo
 				if sc.Backend == "hwmon" {
 					// Same rules as each read, so a setup that could only
 					// fail safe is caught here.
-					p := planDisks(sc.Devices)
+					p := planDisks(sc.Devices, nil)
 					var err error
 					switch {
 					case len(p.failed) > 0:
@@ -145,7 +145,11 @@ func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zo
 					if len(p.noSensor) > 0 {
 						log.Printf("zone %s: disks without a temperature sensor, not monitored: %s", zc.Name, strings.Join(p.noSensor, " "))
 					}
-					sen = &hwmonDiskSensor{devices: sc.Devices}
+					mon := map[string]bool{}
+					for _, d := range p.covered {
+						mon[d] = true
+					}
+					sen = &hwmonDiskSensor{devices: sc.Devices, monitored: mon}
 					break
 				}
 				if _, err := lookPath(cfg.Smartctl); err != nil {

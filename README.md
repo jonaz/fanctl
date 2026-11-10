@@ -179,7 +179,8 @@ With `devices` empty it reads the same disks smartctl would (non-removable
 `sd*` and `nvme*`). While `drivetemp` is loaded, an autodetected SATA disk
 that it found no sensor on (some older SSDs have none; SAS disks) is left
 out and logged at startup as not monitored, and the zone log says e.g.
-`hottest /dev/sdb, 1 without sensor`. Without `drivetemp` loaded, every
+`hottest /dev/sdb, 1 without sensor`. A disk that had a sensor and loses
+it (its hwmon goes away) counts as a failed read. Without `drivetemp` loaded, every
 SATA disk counts as a failed read, so a missing module fails safe instead
 of letting an NVMe decide alone. A disk listed in `devices` must have a
 sensor, or it counts as a failed read. fanctl checks all this at startup
