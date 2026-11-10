@@ -152,9 +152,9 @@ zone fanwall: 60% [disks=40.0°C→60%(hottest /dev/sdc, 2 asleep) gpu=55.0°C�
 
 ## Metrics
 
-Set `"metrics_listen": ":9101"` (or `"127.0.0.1:9101"` to keep it local) to
-serve Prometheus metrics at `/metrics`. It is off by default, and never on
-with `-once`. fanctl refuses to start if it can't listen there; once
+`"metrics_listen": ":9101"` (as in the example; `"127.0.0.1:9101"` keeps it
+local) serves Prometheus metrics at `/metrics`. Leave it out to turn them
+off; they are never on with `-once`. fanctl refuses to start if it can't listen there; once
 running, a problem serving metrics is only logged and never stops fan
 control.
 
@@ -164,7 +164,8 @@ control.
 | `fanctl_zone_wanted_duty_percent` | `zone` | Duty the zone wants now, after the ramp and startup floor |
 | `fanctl_zone_target_duty_percent` | `zone` | Where the ramp is heading |
 | `fanctl_zone_writes_total`, `fanctl_zone_write_errors_total` | `zone` | Duty writes accepted / failed |
-| `fanctl_source_temperature_celsius` | `zone`, `source` | Latest temperature (hottest disk/GPU/core); absent while pending, idle, after a failed read and while failed safe |
+| `fanctl_sensor_temperature_celsius` | `zone`, `source`, `sensor` | Every temperature the latest read got (see below); a disk asleep or unreadable is absent |
+| `fanctl_source_temperature_celsius` | `zone`, `source` | The hottest of those, which the curve uses; absent while pending, idle, after a failed read and while failed safe |
 | `fanctl_source_demand_percent` | `zone`, `source` | Duty the source asks for (100 when failed safe, 0 when idle) |
 | `fanctl_source_state` | `zone`, `source`, `state` | 1 for the current one of `pending`, `ok`, `idle`, `failsafe` |
 | `fanctl_source_reads_total`, `fanctl_source_read_errors_total` | `zone`, `source` | Completed reads / failed or partial ones |
@@ -174,7 +175,12 @@ control.
 | `fanctl_build_info` | `version` | Always 1 |
 
 `source` is the source type (`cpu`, `disks`, `gpu`); a second source of the
-same type in a zone is `disks_2`. Values are refreshed every second. In
+same type in a zone is `disks_2`. `sensor` is the disk (`/dev/sda`, as
+configured; with NVMe multipath each controller, `/dev/nvme1n1 (hwmon4)`),
+the GPU (`gpu0`, in nvidia-smi's order) or the CPU hwmon input with its
+label (`coretemp Package id 0`, `k10temp Tctl`; `coretemp.1 Core 0` with one
+hwmon per socket). A zone reports what its own sources read, so a sensor
+read by two zones appears in both. Values are refreshed every second. In
 `-dry-run` the dry-run writes count as accepted. Fan RPMs come from the BMC's
 sensors, which fanctl doesn't read; use an IPMI exporter for those.
 

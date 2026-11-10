@@ -25,6 +25,15 @@ type Reading struct {
 	// Partial is set when some parts couldn't be read (e.g. one disk of
 	// several): Temp covers only the rest, so it is a lower bound.
 	Partial error
+	// Parts is every temperature read, Temp being the hottest: each disk,
+	// GPU or CPU sensor. For metrics; names are unique within a reading.
+	Parts []PartTemp
+}
+
+// PartTemp is one temperature a sensor read, e.g. {"/dev/sda", 38}.
+type PartTemp struct {
+	Name string
+	Temp float64
 }
 
 // Sensor reads a source. As usual in Go, a non-nil error means no data:
@@ -45,13 +54,30 @@ func (s *cpuSensor) Name() string { return "cpu" }
 
 func (s *cpuSensor) Read(_ context.Context) (Reading, error) {
 	best, found := 0.0, false
-	for _, hd := range hwmonDirs(s.drivers) {
+	var parts []PartTemp
+	dirs := hwmonDirs(s.drivers)
+	perDriver := map[string]int{}
+	for _, hd := range dirs {
+		perDriver[hd.name]++
+	}
+	for _, hd := range dirs {
+		// "coretemp Package id 0"; with one hwmon per socket, the device
+		// tells them apart: "coretemp.1 Core 0".
+		chip := hd.name
+		if perDriver[hd.name] > 1 {
+			if dev, err := filepath.EvalSymlinks(filepath.Join(hd.dir, "device")); err == nil {
+				chip = filepath.Base(dev)
+			} else {
+				chip = hd.name + " " + filepath.Base(hd.dir)
+			}
+		}
 		inputs, _ := filepath.Glob(filepath.Join(hd.dir, "temp*_input"))
 		for _, in := range inputs {
 			t, err := readMilliC(in)
 			if err != nil {
 				continue
 			}
+			parts = append(parts, PartTemp{chip + " " + hwmonTempLabel(in), t})
 			if !found || t > best {
 				best, found = t, true
 			}
@@ -60,7 +86,19 @@ func (s *cpuSensor) Read(_ context.Context) (Reading, error) {
 	if !found {
 		return Reading{}, fmt.Errorf("no hwmon temperatures for %v", s.drivers)
 	}
-	return Reading{Temp: best}, nil
+	return Reading{Temp: best, Parts: parts}, nil
+}
+
+// hwmonTempLabel names a tempN_input: its tempN_label ("Package id 0",
+// "Tctl") if it has one, else "tempN".
+func hwmonTempLabel(input string) string {
+	base := strings.TrimSuffix(input, "_input")
+	if b, err := os.ReadFile(base + "_label"); err == nil {
+		if l := strings.TrimSpace(string(b)); l != "" {
+			return l
+		}
+	}
+	return filepath.Base(base)
 }
 
 // ---- Disks: smartctl, without waking sleeping drives ----
@@ -126,6 +164,7 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 		hottest     string
 		asleep      int
 		failed      []string
+		parts       []PartTemp
 	)
 	// Up to maxParallelSmartctl workers read the disks, so one hung disk
 	// costs a single smartctl timeout rather than one per disk queued
@@ -161,8 +200,11 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 			failed = append(failed, fmt.Sprintf("%s: %v", dev, r.err))
 		case r.sleeping:
 			asleep++
-		case !found || r.temp > best:
-			best, found, hottest = r.temp, true, dev
+		default:
+			parts = append(parts, PartTemp{dev, r.temp})
+			if !found || r.temp > best {
+				best, found, hottest = r.temp, true, dev
+			}
 		}
 	}
 	var partial error
@@ -185,7 +227,7 @@ func (s *diskSensor) Read(ctx context.Context) (Reading, error) {
 	}
 	// A partial failure still returns the readings we have; the controller
 	// counts it as a failure, so it fails safe if it persists.
-	return Reading{Temp: best, Detail: detail, Partial: partial}, nil
+	return Reading{Temp: best, Detail: detail, Partial: partial, Parts: parts}, nil
 }
 
 func (s *diskSensor) readOne(ctx context.Context, dev string) (temp float64, asleep bool, err error) {
@@ -254,11 +296,14 @@ func (s *gpuSensor) Read(ctx context.Context) (Reading, error) {
 		return Reading{}, fmt.Errorf("nvidia-smi: %w", err)
 	}
 	best, found := 0.0, false
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	var parts []PartTemp
+	// One line per GPU, in nvidia-smi's index order.
+	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		t, err := strconv.ParseFloat(strings.TrimSpace(line), 64)
 		if err != nil {
 			continue
 		}
+		parts = append(parts, PartTemp{fmt.Sprintf("gpu%d", i), t})
 		if !found || t > best {
 			best, found = t, true
 		}
@@ -266,7 +311,7 @@ func (s *gpuSensor) Read(ctx context.Context) (Reading, error) {
 	if !found {
 		return Reading{}, fmt.Errorf("no GPU temperature in %q", strings.TrimSpace(string(out)))
 	}
-	return Reading{Temp: best}, nil
+	return Reading{Temp: best, Parts: parts}, nil
 }
 
 func contains(list []string, s string) bool {

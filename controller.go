@@ -48,8 +48,9 @@ type source struct {
 	label      string  // sensor name, numbered if the zone has several of a type
 	temp       float64 // latest temperature, if hasTemp
 	hasTemp    bool
-	reads      uint64 // completed reads
-	readErrors uint64 // failed or partial
+	parts      []PartTemp // every temperature in the latest read
+	reads      uint64     // completed reads
+	readErrors uint64     // failed or partial
 	stuckReads uint64
 	failsafes  uint64
 	readTime   time.Duration // the latest completed read
@@ -85,6 +86,9 @@ func (s *source) apply(r Reading, err error) {
 		problem = r.Partial
 	}
 	s.reads++
+	// Every temperature this read got, whatever the state: a partial read
+	// while failed safe still read the disks it lists.
+	s.parts = r.Parts
 	if problem != nil {
 		s.readErrors++
 		s.failures++
@@ -604,6 +608,7 @@ func (z *zoneCtl) checkStuck(now time.Time) bool {
 		}
 		// Already failed safe (by this read or by fail_after): it stays so
 		// until a read lands, so the logged reason is kept.
+		s.parts = nil // from before the read that hangs
 		if s.state != stateFailsafe {
 			s.failsafe(s.sensor.Name() + "=STUCK")
 			log.Printf("%s: read running for %s, failing safe", s.sensor.Name(), now.Sub(s.startedAt).Round(time.Second))

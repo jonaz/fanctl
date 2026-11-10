@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -218,4 +221,116 @@ func TestMetricsListenValidated(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func partsString(r Reading) string {
+	var s []string
+	for _, p := range r.Parts {
+		s = append(s, fmt.Sprintf("%s=%g", p.Name, p.Temp))
+	}
+	return strings.Join(s, " ")
+}
+
+func TestCPUSensorParts(t *testing.T) {
+	root := t.TempDir()
+	sysRoot = root
+	defer func() { sysRoot = "/" }()
+	write := func(p, s string) {
+		full := filepath.Join(root, p)
+		os.MkdirAll(filepath.Dir(full), 0o755)
+		os.WriteFile(full, []byte(s), 0o644)
+	}
+	// Two sockets: one coretemp hwmon each, both with a "Core 0".
+	for i, n := range []string{"hwmon1", "hwmon2"} {
+		d := "sys/class/hwmon/" + n
+		write(d+"/name", "coretemp\n")
+		write(d+"/temp1_label", fmt.Sprintf("Package id %d\n", i))
+		write(d+"/temp1_input", fmt.Sprintf("%d000\n", 50+i))
+		write(d+"/temp2_label", "Core 0\n")
+		write(d+"/temp2_input", "45000\n")
+		write(d+"/temp3_input", "44000\n") // no label
+		dev := fmt.Sprintf("sys/devices/platform/coretemp.%d", i)
+		os.MkdirAll(filepath.Join(root, dev), 0o755)
+		os.Symlink(filepath.Join(root, dev), filepath.Join(root, d, "device"))
+	}
+	r, err := (&cpuSensor{drivers: []string{"coretemp"}}).Read(t.Context())
+	want := "coretemp.0 Package id 0=50 coretemp.0 Core 0=45 coretemp.0 temp3=44 " +
+		"coretemp.1 Package id 1=51 coretemp.1 Core 0=45 coretemp.1 temp3=44"
+	if err != nil || r.Temp != 51 || partsString(r) != want {
+		t.Fatalf("got %q, %v; want %q", partsString(r), err, want)
+	}
+
+	// One socket: just the driver name.
+	os.RemoveAll(filepath.Join(root, "sys/class/hwmon/hwmon2"))
+	r, _ = (&cpuSensor{drivers: []string{"coretemp"}}).Read(t.Context())
+	if want := "coretemp Package id 0=50 coretemp Core 0=45 coretemp temp3=44"; partsString(r) != want {
+		t.Fatalf("got %q, want %q", partsString(r), want)
+	}
+}
+
+func TestDiskSensorParts(t *testing.T) {
+	f := &fakeRunner{out: map[string]string{
+		smartKey("/dev/sda"): fmt.Sprintf(smartOK, 38),
+		smartKey("/dev/sdb"): fmt.Sprintf(smartOK, 44),
+		smartKey("/dev/sdc"): smartSleep,
+	}, err: map[string]error{smartKey("/dev/sdx"): errors.New("exit status 2")}}
+	s := &diskSensor{run: f, bin: "smartctl", devices: []string{"/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdx"}}
+	r, _ := s.Read(t.Context())
+	// Asleep and unreadable disks have no temperature.
+	if got := partsString(r); got != "/dev/sda=38 /dev/sdb=44" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestHwmonDiskSensorParts(t *testing.T) {
+	fakeDiskSysfs(t)
+	r, err := (&hwmonDiskSensor{}).Read(t.Context())
+	// Multipath: both controllers of /dev/nvme1n1, named by hwmon.
+	want := "/dev/nvme0n1=38 /dev/nvme1n1 (hwmon4)=36 /dev/nvme1n1 (hwmon6)=40 /dev/sda=41 /dev/sdb=45"
+	if err != nil || partsString(r) != want {
+		t.Fatalf("got %q, %v; want %q", partsString(r), err, want)
+	}
+}
+
+func TestGPUSensorParts(t *testing.T) {
+	f := &fakeRunner{out: map[string]string{
+		"nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits": "61\n[N/A]\n55\n",
+	}}
+	r, err := (&gpuSensor{run: f, bin: "nvidia-smi"}).Read(t.Context())
+	if err != nil || r.Temp != 61 || partsString(r) != "gpu0=61 gpu2=55" {
+		t.Fatalf("got %q, %v", partsString(r), err)
+	}
+}
+
+func TestMetricsSensorTemperatures(t *testing.T) {
+	parts := []PartTemp{{"/dev/sda", 38}, {"/dev/sdb", 44}, {"/dev/sdb", 45}}
+	z := newZone(&fakeRunner{}, newSource(stub("disks",
+		result{r: Reading{Temp: 45, Parts: parts}},
+		result{r: Reading{Temp: 38, Parts: parts[:1], Partial: errors.New("/dev/sdb: gone")}},
+		fail(),
+	), time.Second, 0))
+	z.step(t.Context())
+	out := scrape(z)
+	wellFormed(t, out)
+	hasLines(t, out,
+		`fanctl_sensor_temperature_celsius{zone="fanwall",source="disks",sensor="/dev/sda"} 38`,
+		`fanctl_sensor_temperature_celsius{zone="fanwall",source="disks",sensor="/dev/sdb"} 44`,
+		`fanctl_sensor_temperature_celsius{zone="fanwall",source="disks",sensor="/dev/sdb #2"} 45`,
+	)
+	z.step(t.Context()) // partial: only what it read
+	out = scrape(z)
+	hasLines(t, out, `fanctl_sensor_temperature_celsius{zone="fanwall",source="disks",sensor="/dev/sda"} 38`)
+	lacks(t, out, `fanctl_sensor_temperature_celsius{zone="fanwall",source="disks",sensor="/dev/sdb"}`)
+	z.step(t.Context()) // failed: nothing current
+	lacks(t, scrape(z), `fanctl_sensor_temperature_celsius{`)
+}
+
+func TestStuckReadClearsSensorTemperatures(t *testing.T) {
+	z := newZone(&fakeRunner{}, newSource(stub("disks", result{r: Reading{Temp: 40, Parts: []PartTemp{{"/dev/sda", 40}}}}), time.Second, 0))
+	z.step(t.Context())
+	s := z.sources[0]
+	s.inFlight, s.startedAt = true, time.Now().Add(-time.Hour)
+	z.checkStuck(time.Now())
+	z.evaluate(t.Context(), time.Now())
+	lacks(t, scrape(z), `fanctl_sensor_temperature_celsius{`)
 }

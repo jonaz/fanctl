@@ -33,6 +33,7 @@ type sourceMetrics struct {
 	stuck    uint64
 	failsafe uint64 // times it entered failsafe
 	readTime float64
+	parts    []PartTemp // never changed in place, so shared, not copied
 }
 
 // zoneSnap is what /metrics shows for one zone.
@@ -70,7 +71,7 @@ func (z *zoneCtl) publish(o order) {
 		snap[i] = sourceMetrics{
 			label: s.label, state: s.state, temp: temp, demand: real,
 			reads: s.reads, errors: s.readErrors, stuck: s.stuckReads, failsafe: s.failsafes,
-			readTime: s.readTime.Seconds(),
+			readTime: s.readTime.Seconds(), parts: s.parts,
 		}
 	}
 	m := z.metrics
@@ -155,6 +156,17 @@ func writeMetrics(w io.Writer, zones []*zoneCtl) {
 		perSource(func(z zoneSnap, s sourceMetrics, add func(string, float64)) {
 			if !math.IsNaN(s.temp) {
 				add(sl(z, s), s.temp)
+			}
+		}))
+	family("fanctl_sensor_temperature_celsius", "gauge", "Every temperature the latest read got: each disk, GPU or CPU sensor. A disk asleep or unreadable is absent.",
+		perSource(func(z zoneSnap, s sourceMetrics, add func(string, float64)) {
+			seen := map[string]int{}
+			for _, p := range s.parts {
+				name := p.Name
+				if seen[p.Name]++; seen[p.Name] > 1 { // never a duplicate series
+					name = fmt.Sprintf("%s #%d", p.Name, seen[p.Name])
+				}
+				add(sl(z, s)+`,sensor="`+escapeLabel(name)+`"`, p.Temp)
 			}
 		}))
 	family("fanctl_source_demand_percent", "gauge", "Duty the source asks of its zone (max duty when failed safe, 0 when idle).",

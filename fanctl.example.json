@@ -1,6 +1,7 @@
 {
   "exit_mode": "full",
   "reapply": "5m",
+  "metrics_listen": ":9101",
   "zones": [
     {
       "name": "cpu",
