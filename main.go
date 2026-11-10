@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -113,6 +114,44 @@ func buildZones(cfg *Config, run Runner, ipmi BMC, lookPath lookPathFunc) ([]*zo
 			case "cpu":
 				sen = &cpuSensor{drivers: sc.Hwmon}
 			case "disks":
+				if sc.Backend == "hwmon" {
+					// Same rules as each read, so a setup that could only
+					// fail safe is caught here.
+					p := planDisks(sc.Devices, nil)
+					var err error
+					switch {
+					case len(p.failed) > 0:
+						err = errors.New(strings.Join(p.failed, "; "))
+					case len(p.hw) == 0:
+						err = errors.New("no disk with a temperature sensor")
+					}
+					if err != nil && !drivetempLoaded() {
+						err = fmt.Errorf("%w (add drivetemp to /etc/modules-load.d/drivetemp.conf to load it at boot)", err)
+					}
+					if err != nil {
+						if sc.Optional {
+							log.Printf("zone %s: disks: %v, skipping disks", zc.Name, err)
+							continue
+						}
+						return nil, fmt.Errorf("zone %s: disks: %w", zc.Name, err)
+					}
+					var labels []string
+					for _, h := range p.hw {
+						if l := h.label(); !contains(labels, l) { // multipath: one disk, several hwmons
+							labels = append(labels, l)
+						}
+					}
+					log.Printf("zone %s: disk sensors: %s", zc.Name, strings.Join(labels, " "))
+					if len(p.noSensor) > 0 {
+						log.Printf("zone %s: disks without a temperature sensor, not monitored: %s", zc.Name, strings.Join(p.noSensor, " "))
+					}
+					mon := map[string]bool{}
+					for _, d := range p.covered {
+						mon[d] = true
+					}
+					sen = &hwmonDiskSensor{devices: sc.Devices, monitored: mon}
+					break
+				}
 				if _, err := lookPath(cfg.Smartctl); err != nil {
 					if sc.Optional {
 						log.Printf("zone %s: smartctl not found, skipping disks", zc.Name)

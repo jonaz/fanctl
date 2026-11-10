@@ -44,24 +44,15 @@ type cpuSensor struct{ drivers []string }
 func (s *cpuSensor) Name() string { return "cpu" }
 
 func (s *cpuSensor) Read(_ context.Context) (Reading, error) {
-	dirs, _ := filepath.Glob(filepath.Join(sysRoot, "sys/class/hwmon/hwmon*"))
 	best, found := 0.0, false
-	for _, d := range dirs {
-		name, err := os.ReadFile(filepath.Join(d, "name"))
-		if err != nil || !contains(s.drivers, strings.TrimSpace(string(name))) {
-			continue
-		}
-		inputs, _ := filepath.Glob(filepath.Join(d, "temp*_input"))
+	for _, hd := range hwmonDirs(s.drivers) {
+		inputs, _ := filepath.Glob(filepath.Join(hd.dir, "temp*_input"))
 		for _, in := range inputs {
-			b, err := os.ReadFile(in)
+			t, err := readMilliC(in)
 			if err != nil {
 				continue
 			}
-			milli, err := strconv.Atoi(strings.TrimSpace(string(b)))
-			if err != nil {
-				continue
-			}
-			if t := float64(milli) / 1000; !found || t > best {
+			if !found || t > best {
 				best, found = t, true
 			}
 		}
