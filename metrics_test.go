@@ -334,3 +334,22 @@ func TestStuckReadClearsSensorTemperatures(t *testing.T) {
 	z.evaluate(t.Context(), time.Now())
 	lacks(t, scrape(z), `fanctl_sensor_temperature_celsius{`)
 }
+
+// A partial read leaves a new (or just idle) source pending: no source
+// temperature until it is OK, though the sensors it read are shown.
+func TestMetricsNoSourceTemperatureWhilePending(t *testing.T) {
+	part := Reading{Temp: 38, Parts: []PartTemp{{"/dev/sda", 38}}, Partial: errors.New("/dev/sdb: exit status 2")}
+	z := newZone(&fakeRunner{}, newSource(stub("disks", result{r: part}, idle(), result{r: part}), time.Second, 0))
+	for i := range 3 {
+		z.step(t.Context())
+		if i == 1 {
+			continue // idle
+		}
+		out := scrape(z)
+		hasLines(t, out,
+			`fanctl_source_state{zone="fanwall",source="disks",state="pending"} 1`,
+			`fanctl_sensor_temperature_celsius{zone="fanwall",source="disks",sensor="/dev/sda"} 38`,
+		)
+		lacks(t, out, `fanctl_source_temperature_celsius{`)
+	}
+}

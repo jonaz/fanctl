@@ -256,7 +256,7 @@ backend has no way to skip a sleeping disk, and it is not yet known whether
 reading `drivetemp` wakes one (see issue #2). Until that is tested, keep
 the default `smartctl` backend on systems where disks spin down.
 
-Zone keys: `interval` (default for its sources; at least 1 s), `min_duty`, `max_duty`,
+Zone keys: `name` (unique), `interval` (default for its sources; at least 1 s), `min_duty`, `max_duty`,
 `min_change`, `smoothing`, `startup_duty`, `ramp_down_delay`, `ramp_down_rate`.
 Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
 `devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),

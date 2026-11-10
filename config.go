@@ -195,11 +195,16 @@ func (c *Config) Validate() error {
 		return errors.New("no zones configured")
 	}
 	seen := map[int]string{}
+	names := map[string]bool{} // logs and metrics tell zones apart by name
 	for _, z := range c.Zones {
 		if prev, ok := seen[z.IpmiZone]; ok {
 			return fmt.Errorf("zones %q and %q both use ipmi_zone %d", prev, z.Name, z.IpmiZone)
 		}
 		seen[z.IpmiZone] = z.Name
+		if names[z.Name] {
+			return fmt.Errorf("two zones named %q: zone names must be unique", z.Name)
+		}
+		names[z.Name] = true
 		if z.IpmiZone < 0 || z.IpmiZone > 255 {
 			return fmt.Errorf("zone %q: ipmi_zone out of range", z.Name)
 		}

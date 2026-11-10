@@ -64,8 +64,10 @@ func (z *zoneCtl) publish(o order) {
 	snap := make([]sourceMetrics, len(z.sources))
 	for i, s := range z.sources {
 		real, _ := s.want(&z.cfg)
+		// Only once the source is OK: a partial read can set a temperature
+		// while still pending (or just after idle), and pending shows none.
 		temp := math.NaN()
-		if s.hasTemp {
+		if s.hasTemp && s.state == stateOK {
 			temp = s.temp
 		}
 		snap[i] = sourceMetrics{
