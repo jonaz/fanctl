@@ -6,8 +6,23 @@ Built for an X11SSM-F in a SilverStone RM420:
 
 | Zone | IPMI zone | Headers | Follows |
 | --- | --- | --- | --- |
-| `cpu` | 0 | FAN1–FAN4 | CPU package temperature (hwmon `coretemp`) |
-| `fanwall` | 1 | FANA | Hottest disk (smartctl), GPU (nvidia-smi) or sustained CPU load, whichever demands more |
+| `fanwall` | 0 | FAN1, FAN2, FAN3 (one fan wall fan each; FAN4 spare) | Hottest disk (smartctl), GPU (nvidia-smi) or sustained CPU load, whichever demands more |
+| `cpu` | 1 | FANA | CPU package temperature (hwmon `coretemp`) |
+
+### Why this wiring
+
+The BMC sets speed per zone, not per header: FAN1–FAN4 always share one duty
+(zone 0), and FANA has its own (zone 1). Putting the three fan wall fans on
+FAN1–FAN3 instead of daisy-chaining them on FANA means each one reports its
+own RPM, so a stalled fan shows up in `ipmitool sensor list`. FAN4 is free for
+a rear exhaust fan in the same zone.
+
+The catch: without fanctl, the BMC's own modes drive zone 0 from CPU
+temperature and zone 1 from the peripheral sensors, which is backwards for
+this wiring. So the example sets `"exit_mode": "full"`: when fanctl stops,
+every fan goes to 100%. Loud, but nothing can overheat, and it's hard to miss
+that fanctl isn't running. If you wire the CPU fan to FAN1 instead, swap the
+two `ipmi_zone` values and `optimal` is a fine `exit_mode`.
 
 It talks to the BMC directly through the kernel's IPMI device `/dev/ipmi0`, so
 at runtime it only needs `smartctl` (smartmontools) and, for the GPU,
@@ -48,7 +63,8 @@ handy for the one-off threshold setup below.
 - Disks are read with `smartctl -n standby`, so **sleeping disks are not woken**.
   If all disks sleep, the disk source asks for nothing and `min_duty` applies.
 - On SIGTERM/SIGINT it restores the BMC fan mode (`exit_mode`, default
-  `optimal`), so the BMC takes over again.
+  `optimal`; the example uses `full`, see [Why this wiring](#why-this-wiring)),
+  so the BMC takes over again.
 
 ### Failsafes
 
@@ -102,9 +118,10 @@ Lower the BMC's low-RPM alarms first, or quiet fans make the BMC pulse them to
 100%:
 
 ```bash
-sudo ipmitool sensor thresh FAN1 lower 0 100 200
-sudo ipmitool sensor thresh FANA lower 0 100 200
+for f in FAN1 FAN2 FAN3 FANA; do sudo ipmitool sensor thresh $f lower 0 100 200; done
 ```
+
+Add FAN4 if you connect a fan there.
 
 Check what it sees, without touching the BMC:
 

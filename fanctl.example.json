@@ -1,10 +1,10 @@
 {
-  "exit_mode": "optimal",
+  "exit_mode": "full",
   "reapply": "5m",
   "zones": [
     {
       "name": "cpu",
-      "ipmi_zone": 0,
+      "ipmi_zone": 1,
       "interval": "2s",
       "min_duty": 25,
       "max_duty": 100,
@@ -22,7 +22,7 @@
     },
     {
       "name": "fanwall",
-      "ipmi_zone": 1,
+      "ipmi_zone": 0,
       "interval": "5s",
       "min_duty": 30,
       "max_duty": 100,
