@@ -106,6 +106,8 @@ func TestValidateRejects(t *testing.T) {
 		{"must increase", []Zone{zone("a", 0, "cpu", [][2]float64{{40, 20}, {30, 50}})}},
 		{"unknown source type", []Zone{zone("a", 0, "fan", ok)}},
 		{"both use ipmi_zone", []Zone{zone("a", 0, "cpu", ok), zone("b", 0, "cpu", ok)}},
+		{"two zones named \"a\"", []Zone{zone("a", 0, "cpu", ok), zone("a", 1, "cpu", ok)}},
+		{"two zones named \"\"", []Zone{zone("", 0, "cpu", ok), zone("", 1, "cpu", ok)}},
 		{"fail_after", []Zone{{Name: "a", Sources: []Source{{Type: "cpu", Curve: ok, FailAfter: -1}}}}},
 		{"startup_duty must be between min_duty", []Zone{{Name: "a", MinDuty: 30, StartupDuty: ptr(20), Sources: []Source{{Type: "cpu", Curve: ok}}}}},
 		{"startup_duty must be between min_duty", []Zone{{Name: "a", MaxDuty: 60, StartupDuty: ptr(80), Sources: []Source{{Type: "cpu", Curve: ok}}}}},

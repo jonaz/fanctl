@@ -230,6 +230,13 @@ func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
 	expired := false
 	timedOut := result{err: fmt.Errorf("read timed out after %s", hwmonReadTimeout)}
 	best, found, hottest := 0.0, false, ""
+	var parts []PartTemp
+	// With multipath several hwmons cover one disk: name each by its
+	// hwmon too, "/dev/nvme0n1 (hwmon3)".
+	perLabel := map[string]int{}
+	for _, h := range hw {
+		perLabel[h.label()]++
+	}
 	for i, h := range hw {
 		var r result
 		if expired { // the rest get only what is already there
@@ -250,8 +257,15 @@ func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
 		switch {
 		case r.err != nil:
 			failed = append(failed, fmt.Sprintf("%s: %v", h.label(), r.err))
-		case !found || r.temp > best:
-			best, found, hottest = r.temp, true, h.label()
+		default:
+			name := h.label()
+			if perLabel[name] > 1 {
+				name += " (" + filepath.Base(h.dir) + ")"
+			}
+			parts = append(parts, PartTemp{name, r.temp})
+			if !found || r.temp > best {
+				best, found, hottest = r.temp, true, h.label()
+			}
 		}
 	}
 	var partial error
@@ -268,7 +282,7 @@ func (s *hwmonDiskSensor) Read(ctx context.Context) (Reading, error) {
 	if n := len(plan.noSensor); n > 0 {
 		detail += fmt.Sprintf(", %d without sensor", n)
 	}
-	return Reading{Temp: best, Detail: detail, Partial: partial}, nil
+	return Reading{Temp: best, Detail: detail, Partial: partial, Parts: parts}, nil
 }
 
 type hwmonDir struct{ dir, name string }
