@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"time"
 )
@@ -39,7 +40,10 @@ type Config struct {
 	ExitMode string `json:"exit_mode"`
 	// Re-send the current duty at least this often, in case the BMC resets it.
 	Reapply Duration `json:"reapply"`
-	Zones   []Zone   `json:"zones"`
+	// Serve Prometheus metrics at http://<this>/metrics, e.g. ":9101" or
+	// "127.0.0.1:9101". Empty = off.
+	MetricsListen string `json:"metrics_listen,omitempty"`
+	Zones         []Zone `json:"zones"`
 }
 
 type Zone struct {
@@ -181,6 +185,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Reapply.Duration < minInterval {
 		return fmt.Errorf("reapply must be at least %s", minInterval)
+	}
+	if c.MetricsListen != "" {
+		if _, _, err := net.SplitHostPort(c.MetricsListen); err != nil {
+			return fmt.Errorf("metrics_listen %q: %w", c.MetricsListen, err)
+		}
 	}
 	if len(c.Zones) == 0 {
 		return errors.New("no zones configured")

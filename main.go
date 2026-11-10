@@ -57,6 +57,15 @@ func main() {
 		return
 	}
 
+	// Before the BMC is touched, so a port in use stops fanctl cleanly.
+	if cfg.MetricsListen != "" {
+		m, err := startMetrics(cfg.MetricsListen, zones)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer m.Close()
+	}
+
 	// Full mode: the BMC stops overriding the duty we set.
 	if err := ipmi.SetMode(ctx, fanModes["full"]); err != nil {
 		log.Fatalf("set fan mode full: %v", err)

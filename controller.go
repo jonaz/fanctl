@@ -44,6 +44,16 @@ type source struct {
 	hasHeld  bool
 	frag     string // last reading, for logs
 
+	// For metrics, also loop-owned; publish copies them.
+	label      string  // sensor name, numbered if the zone has several of a type
+	temp       float64 // latest temperature, if hasTemp
+	hasTemp    bool
+	reads      uint64 // completed reads
+	readErrors uint64 // failed or partial
+	stuckReads uint64
+	failsafes  uint64
+	readTime   time.Duration // the latest completed read
+
 	// Poll scheduling, also loop-owned.
 	// A read is stuck once it is in flight past stuckAt; that is derived,
 	// never stored, so it can't drift out of step with these.
@@ -74,7 +84,9 @@ func (s *source) apply(r Reading, err error) {
 	if problem == nil {
 		problem = r.Partial
 	}
+	s.reads++
 	if problem != nil {
+		s.readErrors++
 		s.failures++
 		log.Printf("%s: read error (%d/%d): %v", name, s.failures, s.cfg.FailAfter, problem)
 	} else {
@@ -90,6 +102,7 @@ func (s *source) apply(r Reading, err error) {
 	case err != nil:
 		// No data: keep the previous demand; fail_after bounds how long.
 		s.endIdle()
+		s.hasTemp = false
 		s.frag = name + "=err"
 	case r.Partial != nil:
 		// The unreadable part could be the hottest: only raise. A reading
@@ -100,11 +113,13 @@ func (s *source) apply(r Reading, err error) {
 			s.held = math.Max(s.held, s.avg.add(r.Temp))
 		}
 		s.demand = math.Max(s.demand, Interpolate(s.cfg.Curve, r.Temp))
+		s.temp, s.hasTemp = r.Temp, true
 		s.frag = fmt.Sprintf("%s=%.1f°C→%d%%(partial)", name, r.Temp, int(math.Round(s.demand)))
 	case r.Idle:
 		s.state, s.demand = stateIdle, 0
 		s.avg.reset()
 		s.hasHeld = false
+		s.hasTemp = false
 		s.frag = fmt.Sprintf("%s=idle(%s)", name, r.Detail)
 	default:
 		t := s.avg.add(r.Temp)
@@ -115,6 +130,7 @@ func (s *source) apply(r Reading, err error) {
 		}
 		s.held, s.hasHeld = t, true
 		s.state, s.demand = stateOK, Interpolate(s.cfg.Curve, t)
+		s.temp, s.hasTemp = r.Temp, true
 		s.frag = fmt.Sprintf("%s=%.1f°C→%d%%", name, t, int(math.Round(s.demand)))
 		if r.Detail != "" {
 			s.frag += "(" + r.Detail + ")"
@@ -136,9 +152,13 @@ func (s *source) endIdle() {
 // hysteresis are cleared, so the first reading after recovery isn't mixed
 // with pre-failure ones.
 func (s *source) failsafe(frag string) {
+	if s.state != stateFailsafe {
+		s.failsafes++
+	}
 	s.state, s.frag = stateFailsafe, frag
 	s.avg.reset()
 	s.hasHeld = false
+	s.hasTemp = false
 }
 
 // want is what this source asks of zone z: real demand (which the ramp
@@ -299,14 +319,29 @@ type zoneCtl struct {
 	kick   chan struct{} // wakes the writer goroutine; nil = write inline
 
 	bmc bmcState // owned by the writer
+
+	metrics *zoneMetrics // has its own lock; see metrics.go
 }
 
 func newZoneCtl(cfg Zone, ipmi BMC, reapply time.Duration) *zoneCtl {
-	return &zoneCtl{cfg: cfg, ipmi: ipmi, reapply: reapply, bmc: bmcState{duty: -1}}
+	return &zoneCtl{cfg: cfg, ipmi: ipmi, reapply: reapply, bmc: bmcState{duty: -1}, metrics: newZoneMetrics(cfg.Name)}
 }
 
 func (z *zoneCtl) addSource(s *source) {
-	s.frag = s.sensor.Name() + "=pending" // until the first poll
+	name := s.sensor.Name()
+	s.frag = name + "=pending" // until the first poll
+	// Two sources of one type (say, disks with different curves) need
+	// telling apart in metrics: the second is "disks_2".
+	n := 1
+	for _, o := range z.sources {
+		if o.sensor.Name() == name {
+			n++
+		}
+	}
+	s.label = name
+	if n > 1 {
+		s.label = fmt.Sprintf("%s_%d", name, n)
+	}
 	z.sources = append(z.sources, s)
 }
 
@@ -314,10 +349,12 @@ func (z *zoneCtl) addSource(s *source) {
 // --once and tests.
 func (z *zoneCtl) step(ctx context.Context) {
 	for _, s := range z.sources {
+		start := time.Now()
 		r, err := s.sensor.Read(ctx)
 		if ctx.Err() != nil {
 			return // a cancelled read is not a sensor failure
 		}
+		s.readTime = time.Since(start)
 		s.apply(r, err)
 	}
 	z.evaluate(ctx, time.Now())
@@ -337,12 +374,14 @@ func (z *zoneCtl) evaluate(ctx context.Context, now time.Time) {
 	}
 	lo, hi := z.cfg.MinDuty, z.cfg.MaxDuty
 	level := z.ramp.step(now, float64(clampRound(real, lo, hi)), z.cfg.RampDownDelay.Duration, *z.cfg.RampDownRate)
-	z.post(ctx, order{
+	o := order{
 		valid:  true,
 		duty:   clampRound(math.Max(level, floor), lo, hi),
 		target: clampRound(math.Max(real, floor), lo, hi),
 		parts:  parts,
-	})
+	}
+	z.publish(o)
+	z.post(ctx, o)
 }
 
 // post hands o to the writer, or writes it inline without one.
@@ -382,8 +421,10 @@ func (z *zoneCtl) flush(ctx context.Context) time.Duration {
 			return 0 // shutting down
 		}
 		log.Printf("zone %s: %v", z.cfg.Name, err)
+		z.metrics.wrote(o.duty, err)
 		return z.bmc.failed(o.duty, now)
 	}
+	z.metrics.wrote(o.duty, nil)
 	if o.duty != z.bmc.duty {
 		log.Printf("zone %s: %d%% (target %d%%) [%s]", z.cfg.Name, o.duty, o.target, strings.Join(o.parts, " "))
 	}
@@ -510,6 +551,7 @@ func (z *zoneCtl) land(ctx context.Context, res pollResult) bool {
 	if ctx.Err() != nil { // a cancelled read is not a sensor failure
 		return false
 	}
+	s.readTime = time.Since(s.startedAt)
 	s.apply(res.r, res.err)
 	return true
 }
@@ -568,6 +610,7 @@ func (z *zoneCtl) checkStuck(now time.Time) bool {
 			failed = true
 		}
 		if !s.abandoned {
+			s.stuckReads++
 			s.abandoned, s.inFlight = true, false
 			if s.cancel != nil {
 				s.cancel()

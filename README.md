@@ -150,6 +150,44 @@ Logs show a line whenever a zone's duty changes, e.g.
 zone fanwall: 60% [disks=40.0°C→60%(hottest /dev/sdc, 2 asleep) gpu=55.0°C→37%]
 ```
 
+## Metrics
+
+Set `"metrics_listen": ":9101"` (or `"127.0.0.1:9101"` to keep it local) to
+serve Prometheus metrics at `/metrics`. It is off by default, and never on
+with `-once`. fanctl refuses to start if it can't listen there; once
+running, a problem serving metrics is only logged and never stops fan
+control.
+
+| Metric | Labels | |
+| --- | --- | --- |
+| `fanctl_zone_duty_percent` | `zone` | Last duty the BMC accepted (absent until one has) |
+| `fanctl_zone_wanted_duty_percent` | `zone` | Duty the zone wants now, after the ramp and startup floor |
+| `fanctl_zone_target_duty_percent` | `zone` | Where the ramp is heading |
+| `fanctl_zone_writes_total`, `fanctl_zone_write_errors_total` | `zone` | Duty writes accepted / failed |
+| `fanctl_source_temperature_celsius` | `zone`, `source` | Latest temperature (hottest disk/GPU/core); absent while pending, idle, after a failed read and while failed safe |
+| `fanctl_source_demand_percent` | `zone`, `source` | Duty the source asks for (100 when failed safe, 0 when idle) |
+| `fanctl_source_state` | `zone`, `source`, `state` | 1 for the current one of `pending`, `ok`, `idle`, `failsafe` |
+| `fanctl_source_reads_total`, `fanctl_source_read_errors_total` | `zone`, `source` | Completed reads / failed or partial ones |
+| `fanctl_source_stuck_reads_total` | `zone`, `source` | Reads given up on as stuck |
+| `fanctl_source_failsafes_total` | `zone`, `source` | Times the source failed safe |
+| `fanctl_source_read_duration_seconds` | `zone`, `source` | How long the latest read took |
+| `fanctl_build_info` | `version` | Always 1 |
+
+`source` is the source type (`cpu`, `disks`, `gpu`); a second source of the
+same type in a zone is `disks_2`. Values are refreshed every second. In
+`-dry-run` the dry-run writes count as accepted. Fan RPMs come from the BMC's
+sensors, which fanctl doesn't read; use an IPMI exporter for those.
+
+Example alerts:
+
+```yaml
+- alert: FanctlFailsafe
+  expr: fanctl_source_state{state="failsafe"} == 1
+  for: 5m
+- alert: FanctlBMCWritesFailing
+  expr: increase(fanctl_zone_write_errors_total[10m]) > 0
+```
+
 ## Configuration
 
 See `fanctl.example.json`. Curve points are `[°C, duty %]` with increasing
@@ -218,6 +256,7 @@ Source keys: `curve`, `interval`, `hysteresis`, `fail_after`, `optional`,
 `devices` (disk list; empty = autodetect non-removable `sd*` and `nvme*`),
 `backend` (disks: `smartctl`, the default, or `hwmon`),
 `hwmon` (CPU driver names). Top level: `exit_mode`, `reapply` (at least 1 s),
+`metrics_listen` (see [Metrics](#metrics)),
 `ipmi` (`device`, the default, or `ipmitool`), `ipmi_device` (default
 `/dev/ipmi0`) and tool paths `ipmitool`, `smartctl`, `nvidia_smi`.
 
